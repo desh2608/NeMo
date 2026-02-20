@@ -11,18 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict
 
 import torch
-from omegaconf import open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import PeftModel
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.asr.models import ASRModel
-from nemo.collections.speechlm2.modules import AudioPerceptionModule
+from nemo.collections.speechlm2.modules import AudioPerceptionModule, SoundProjection
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.utils import logging
@@ -124,21 +125,106 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
+def _is_extracted_encoder_dir(path: str) -> bool:
+    """Check whether ``path`` is an extracted encoder directory (safetensors + NeMo config)."""
+    p = Path(path)
+    if not p.is_dir() or not (p / "config.json").exists():
+        return False
+    with open(p / "config.json") as f:
+        config = json.load(f)
+    return "preprocessor" in config and "encoder" in config
+
+
+def _load_safetensors_dir(directory: str | Path) -> Dict[str, torch.Tensor]:
+    """Load a sharded safetensors checkpoint directory into a single state dict.
+
+    Reads ``model.safetensors.index.json`` to discover shard files, then loads
+    and merges all shards.  Falls back to a single ``model.safetensors`` if no
+    index file is present.
+    """
+    directory = Path(directory)
+    index_path = directory / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        shard_files = sorted(set(index["weight_map"].values()))
+        state_dict = {}
+        for shard_file in shard_files:
+            state_dict.update(load_file(str(directory / shard_file), device="cpu"))
+        return state_dict
+    # Single-file fallback
+    single = directory / "model.safetensors"
+    if single.exists():
+        return load_file(str(single), device="cpu")
+    raise FileNotFoundError(f"No safetensors files found in {directory}")
+
+
+def _setup_from_extracted(model: torch.nn.Module):
+    """Set up ``AudioPerceptionModule`` from an extracted VL encoder directory.
+
+    Loads the NeMo-compatible config, builds the perception module, loads
+    encoder weights, and optionally replaces the projection with
+    ``SoundProjection`` if ``model.cfg.pretrained_proj`` is set.
+    """
+    encoder_dir = Path(model.cfg.pretrained_asr)
+
+    # 1. Load config and populate perception cfg
+    with open(encoder_dir / "config.json") as f:
+        config = json.load(f)
+
+    with open_dict(model.cfg):
+        model.cfg.perception.preprocessor = OmegaConf.create(config["preprocessor"])
+        model.cfg.perception.encoder = OmegaConf.create(config["encoder"])
+        if model.llm is not None:
+            model.cfg.perception.output_dim = model.llm.config.hidden_size
+
+    # 2. Build AudioPerceptionModule
+    model.perception = AudioPerceptionModule(model.cfg.perception).train()
+
+    # 3. Load encoder weights (strict=False: preprocessor buffers, modality_adapter, proj are missing — expected)
+    encoder_state = _load_safetensors_dir(encoder_dir)
+    result = model.perception.load_state_dict(encoder_state, strict=False)
+    logging.info(
+        f"Loaded extracted encoder: {len(encoder_state)} keys, "
+        f"{len(result.missing_keys)} missing, {len(result.unexpected_keys)} unexpected"
+    )
+
+    # 4. Optionally load projection
+    pretrained_proj = getattr(model.cfg, "pretrained_proj", None)
+    if pretrained_proj and Path(pretrained_proj).is_dir():
+        with open(Path(pretrained_proj) / "config.json") as f:
+            proj_config = json.load(f)
+        llm_hidden_size = model.llm.config.hidden_size if model.llm is not None else model.cfg.perception.output_dim
+        model.perception.proj = SoundProjection(
+            sound_hidden_size=proj_config["hidden_size"],
+            projection_hidden_size=proj_config["projection_hidden_size"],
+            llm_hidden_size=llm_hidden_size,
+            bias=proj_config.get("projection_bias", False),
+        )
+        proj_state = _load_safetensors_dir(pretrained_proj)
+        model.perception.proj.load_state_dict(proj_state)
+        logging.info(f"Loaded extracted projection: {len(proj_state)} keys")
+
+
 def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
-    with a pretrained NeMo ``ASRModel``.
+    with a pretrained NeMo ``ASRModel`` or an extracted VL encoder directory.
     The result is assigned to ``model.perception`` attribute and is trainable.
     """
     if pretrained_weights:
-        asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
-        with open_dict(model.cfg):
-            model.cfg.perception.preprocessor = asr.cfg.preprocessor
-            model.cfg.perception.encoder = asr.cfg.encoder
-            if model.llm is not None:
-                model.cfg.perception.output_dim = model.llm.config.hidden_size
-        model.perception = AudioPerceptionModule(model.cfg.perception).train()
-        model.perception.load_state_dict(asr.state_dict(), strict=False)
+        pretrained_asr = model.cfg.pretrained_asr
+        if _is_extracted_encoder_dir(pretrained_asr):
+            _setup_from_extracted(model)
+        else:
+            asr = load_pretrained_nemo(ASRModel, pretrained_asr).eval()
+            with open_dict(model.cfg):
+                model.cfg.perception.preprocessor = asr.cfg.preprocessor
+                model.cfg.perception.encoder = asr.cfg.encoder
+                if model.llm is not None:
+                    model.cfg.perception.output_dim = model.llm.config.hidden_size
+            model.perception = AudioPerceptionModule(model.cfg.perception).train()
+            model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
 

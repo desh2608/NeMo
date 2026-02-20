@@ -102,6 +102,53 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         return encoded, encoded_len
 
 
+class SquaredReLU(nn.Module):
+    """Squared ReLU activation function."""
+
+    def forward(self, x):
+        return torch.pow(torch.nn.functional.relu(x), 2)
+
+
+class SoundProjection(nn.Module):
+    """MLP projection from sound encoder hidden size to LLM hidden size.
+
+    Architecture: LayerNorm -> linear1 -> SquaredReLU -> linear2
+
+    Weight keys match the extracted VL checkpoint naming:
+    ``linear1.weight``, ``norm.weight``, ``norm.bias``, ``linear2.weight``,
+    and optionally ``linear1.bias``, ``linear2.bias``.
+    """
+
+    def __init__(
+        self,
+        sound_hidden_size: int,
+        projection_hidden_size: int,
+        llm_hidden_size: int,
+        bias: bool = True,
+        eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(sound_hidden_size, eps=eps)
+        self.linear1 = nn.Linear(sound_hidden_size, projection_hidden_size, bias=bias)
+        self.activation = SquaredReLU()
+        self.linear2 = nn.Linear(projection_hidden_size, llm_hidden_size, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project sound embeddings to LLM embedding space.
+
+        Args:
+            hidden_states: Sound encoder output ``[batch, seq_len, sound_hidden_size]``
+
+        Returns:
+            Projected embeddings ``[batch, seq_len, llm_hidden_size]``
+        """
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.linear1(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        hidden_states = self.linear2(hidden_states)
+        return hidden_states
+
+
 class IdentityConnector(nn.Module):
     """User to pass encoder's representations as-is to the LLM."""
 
