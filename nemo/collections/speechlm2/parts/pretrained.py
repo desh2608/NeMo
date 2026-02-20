@@ -73,9 +73,9 @@ def load_pretrained_automodel(model_path_or_name: str, pretrained_weights: bool 
     from nemo_automodel import NeMoAutoModelForCausalLM
 
     if pretrained_weights:
-        return NeMoAutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, **kwargs)
+        return NeMoAutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, trust_remote_code=True, **kwargs)
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name)
+        config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
         return NeMoAutoModelForCausalLM.from_config(config, torch_dtype=dtype, **kwargs)
 
 
