@@ -115,7 +115,7 @@ class SoundProjection(nn.Module):
     Architecture: LayerNorm -> linear1 -> SquaredReLU -> linear2
 
     Weight keys match the extracted VL checkpoint naming:
-    ``linear1.weight``, ``norm.weight``, ``norm.bias``, ``linear2.weight``,
+    ``linear1.weight``, ``norm.weight``, ``linear2.weight``,
     and optionally ``linear1.bias``, ``linear2.bias``.
     """
 
@@ -128,7 +128,7 @@ class SoundProjection(nn.Module):
         eps: float = 1e-5,
     ):
         super().__init__()
-        self.norm = nn.LayerNorm(sound_hidden_size, eps=eps)
+        self.norm = nn.LayerNorm(sound_hidden_size, eps=eps, bias=False)
         self.linear1 = nn.Linear(sound_hidden_size, projection_hidden_size, bias=bias)
         self.activation = SquaredReLU()
         self.linear2 = nn.Linear(projection_hidden_size, llm_hidden_size, bias=bias)

@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import nemo.collections.common.callbacks
-from nemo.collections.common import data, losses, parts, tokenizers
+import nemo.collections.common.data
+import nemo.collections.common.losses
+import nemo.collections.common.parts
+import nemo.collections.common.tokenizers
 from nemo.package_info import __version__
 
 # Set collection version equal to NeMo version.
