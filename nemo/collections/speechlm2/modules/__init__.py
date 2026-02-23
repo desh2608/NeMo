@@ -11,11 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .depthformer import Depthformer, DepthformerConfig
+from .mimi_tokenizer import MimiTokenizer
 from .perception import AudioPerceptionModule, SoundProjection
 from .speech_generation import TransformerARSpeechDecoder
 
 __all__ = [
     'AudioPerceptionModule',
+    'Depthformer',
+    'DepthformerConfig',
+    'MimiTokenizer',
     'SoundProjection',
     'TransformerARSpeechDecoder',
 ]
