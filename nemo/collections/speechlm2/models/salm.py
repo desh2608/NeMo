@@ -51,10 +51,18 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
+        self.audio_out_locator_tag = self.cfg.get("audio_out_locator_tag", "<|audio_out|>")
+        self.audio_loss_weight = self.cfg.get("audio_loss_weight", 1.0)
+
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
+        special_tokens = [self.audio_locator_tag]
+        if self.cfg.get("depthformer") is not None:
+            special_tokens.extend([self.audio_out_locator_tag, "<|audio_start|>", "<|audio_end|>"])
+        self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         self.llm = None  # populated by configure_model
         self.perception = None  # populated by configure_model
+        self.depthformer = None  # populated by configure_model (if depthformer config present)
+        self._mimi = None  # lazy-loaded MimiTokenizer (not a submodule)
 
         self._use_fsdp = False
         self._use_tp = False
@@ -83,7 +91,7 @@ class SALM(LightningModule, HFHubMixin):
         weight = self.embed_tokens.weight
         if isinstance(weight, DTensor):
             weight = weight.full_tensor()
-        return torch.nn.functional.embedding(input_ids, weight)
+        return torch.nn.functional.embedding(input_ids.to(weight.device), weight)
 
     @property
     def text_vocab_size(self):
@@ -115,6 +123,10 @@ class SALM(LightningModule, HFHubMixin):
         return self.tokenizer.token_to_id(self.audio_locator_tag)
 
     @property
+    def audio_out_locator_tag_id(self) -> int:
+        return self.tokenizer.token_to_id(self.audio_out_locator_tag)
+
+    @property
     def token_equivalent_duration(self) -> float:
         """
         Returns the audio duration corresponding to a single frame/token at the output of ``self.perception``.
@@ -124,6 +136,18 @@ class SALM(LightningModule, HFHubMixin):
     @property
     def sampling_rate(self) -> int:
         return self.perception.preprocessor.featurizer.sample_rate
+
+    def _get_mimi(self):
+        """Lazy-load and cache the Mimi tokenizer (not a submodule to avoid FSDP/optimizer interference)."""
+        if self._mimi is None:
+            from nemo.collections.speechlm2.modules.mimi_tokenizer import MimiTokenizer
+
+            self._mimi = MimiTokenizer(
+                mimi_model_id=self.cfg.mimi_model_id,
+                num_codebooks=self.cfg.depthformer.num_codebooks,
+            )
+            self._mimi.maybe_load(device=self.device)
+        return self._mimi
 
     def forward(
         self,
@@ -139,11 +163,13 @@ class SALM(LightningModule, HFHubMixin):
 
         """
         # input_embeds and out: (B, T, H)
+        need_hidden_states = self.depthformer is not None and cache is None
         out = self.llm(
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
             past_key_values=cache,
             use_cache=cache is not None,
+            output_hidden_states=need_hidden_states,
             return_dict=True,
         )
         if not isinstance(out, dict):
@@ -153,6 +179,8 @@ class SALM(LightningModule, HFHubMixin):
             ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
             if cache is not None:
                 ans["cache"] = out["past_key_values"]
+            if need_hidden_states and "hidden_states" in out:
+                ans["hidden_states"] = out["hidden_states"][-1]  # last layer
         return ans
 
     def prepare_inputs(self, batch: dict):
@@ -160,9 +188,10 @@ class SALM(LightningModule, HFHubMixin):
         Performs additional processing on the mini-batch collected from dataloader.
         Notably:
         * Convert source audio to speech representations.
-        * Convert target audio to target audio tokens.
+        * Convert target audio to target audio tokens (via Mimi codec, if depthformer is active).
         * Convert target text to embeddings.
         * Combine the input audio and target text embeddings.
+        * Replace <|audio|> and <|audio_out|> placeholders with their respective embeddings.
         * Take care of any necessary slicing to align the shapes of source audio,
             target audio, and target token ids.
         """
@@ -173,38 +202,85 @@ class SALM(LightningModule, HFHubMixin):
             input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
         )
         audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
-        input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
-        text_embs = self._embed_tokens(input_ids_to_embed)
-        input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
-            input_ids=batch["input_ids"],
+
+        # Build the placeholder replacement dict
+        placeholder_dict = {self.audio_locator_tag_id: audio_embs}
+
+        # Prepare audio output embeddings if depthformer is active and target audio is present
+        target_audio_codes_list = []
+        has_audio_output = (
+            self.depthformer is not None
+            and "target_audios" in batch
+            and batch["target_audios"] is not None
+            and batch["target_audios"].shape[0] > 0
+        )
+        if has_audio_output:
+            mimi = self._get_mimi()
+            codes, code_lens = mimi.encode(
+                batch["target_audios"], batch["target_audio_lens"],
+                source_sample_rate=self.sampling_rate,
+            )
+            audio_out_embs = []
+            for j in range(codes.shape[0]):
+                T_frames = code_lens[j].item()
+                codes_j = codes[j, :, :T_frames].T  # (T_frames, K)
+                target_audio_codes_list.append(codes_j)
+                # Shifted codes for teacher forcing: first frame gets zeros
+                shifted = torch.zeros_like(codes_j)
+                shifted[1:] = codes_j[:-1]
+                audio_out_embs.append(self.depthformer.embed_audio_tokens(shifted))
+            placeholder_dict[self.audio_out_locator_tag_id] = audio_out_embs
+
+        # Zero out all placeholder IDs before embedding
+        input_ids = batch["input_ids"]
+        ids_to_embed = input_ids.clone()
+        for pid in placeholder_dict:
+            ids_to_embed = torch.where(ids_to_embed == pid, 0, ids_to_embed)
+        text_embs = self._embed_tokens(ids_to_embed)
+
+        # Single-pass replacement of all placeholder types
+        target_ids_raw = input_ids.where(batch["loss_mask"], -100)
+        input_embs, target_ids, attention_mask, placeholder_tags = replace_placeholders_and_build_targets(
+            input_ids=input_ids,
             embeds=text_embs,
             padding_id=self.text_pad_id,
-            placeholder_id=self.audio_locator_tag_id,
-            replacements=audio_embs,
-            target_ids=batch["input_ids"].where(batch["loss_mask"], -100),  # CrossEntropyLoss().ignore_index
+            placeholder_replacement_dict=placeholder_dict,
+            target_ids=target_ids_raw,
         )
+
         input_embs = input_embs[:, :-1]
         attention_mask = attention_mask[:, :-1]
         target_ids = target_ids[:, 1:]
+        placeholder_tags = placeholder_tags[:, 1:]  # align with target
 
-        # Combine target audio and text into a single tensor to slice them together.
-        # It will also help us truncate the sequence lengths to be divisible by TP world size,
-        # when TP is enabled.
-        # Input ids: (B, T, K+1)
         if self._use_tp:
             tp_world_size = self.device_mesh["tp"].size()
             if (remainder := (input_embs.shape[1] - 1) % tp_world_size) != 0:
-                # Truncate some tokens from the end to make the sequence lenght shape divisible by tensor parallelism
-                # world size. Otherwise, sequence parallelism will change the input shape making leading to mismatches.
                 input_embs = input_embs[:, :-remainder]
                 attention_mask = attention_mask[:, :-remainder]
                 target_ids = target_ids[:, :-remainder]
+                placeholder_tags = placeholder_tags[:, :-remainder]
 
-        return {
+        result = {
             "input_embeds": input_embs,
             "attention_mask": attention_mask,
             "target_ids": target_ids,
         }
+
+        # Build audio output mask and scatter target codes using placeholder_tags
+        if has_audio_output:
+            audio_output_mask = (placeholder_tags == self.audio_out_locator_tag_id)
+            # Scatter target_audio_codes into a padded (B, T, K) tensor aligned with the sequence
+            K = self.cfg.depthformer.num_codebooks
+            target_audio_codes = torch.zeros(
+                *placeholder_tags.shape, K, dtype=torch.long, device=placeholder_tags.device
+            )
+            all_codes = torch.cat(target_audio_codes_list, dim=0)  # (total_frames, K)
+            target_audio_codes[audio_output_mask] = all_codes
+            result["audio_output_mask"] = audio_output_mask
+            result["target_audio_codes"] = target_audio_codes
+
+        return result
 
     def training_step(self, batch: dict, batch_idx: int):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
@@ -218,7 +294,7 @@ class SALM(LightningModule, HFHubMixin):
         forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
         num_frames = (inputs["target_ids"] != -100).long().sum()
         with loss_parallel():
-            loss = (
+            text_loss = (
                 torch.nn.functional.cross_entropy(
                     forward_outputs["logits"].flatten(0, 1),  # (B, T, Vt) -> (*, Vt)
                     inputs["target_ids"].flatten(0, 1),
@@ -227,12 +303,30 @@ class SALM(LightningModule, HFHubMixin):
                 )
                 / num_frames
             )
+
+        # Audio loss via depthformer
+        audio_loss = text_loss.new_tensor(0.0)
+        if (
+            self.depthformer is not None
+            and "audio_output_mask" in inputs
+            and "hidden_states" in forward_outputs
+        ):
+            audio_loss = self.depthformer.forward_train(
+                forward_outputs["hidden_states"],
+                inputs["target_audio_codes"],
+                inputs["audio_output_mask"],
+            )
+
+        loss = text_loss + self.audio_loss_weight * audio_loss
+
         if torch.distributed.get_rank() == 0:
-            print(f'loss={loss.detach().cpu().item()}')
+            print(f'text_loss={text_loss.detach().cpu().item():.4f} audio_loss={audio_loss.detach().cpu().item():.4f}')
 
         B, T = inputs["input_embeds"].shape[:2]
         ans = {
             "loss": loss,
+            "text_loss": text_loss,
+            "audio_loss": audio_loss,
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
             ),
@@ -247,6 +341,7 @@ class SALM(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self._partial_val_losses = defaultdict(list)
+        self._partial_val_audio_losses = defaultdict(list)
         self._partial_accuracies = defaultdict(list)
 
     def on_validation_epoch_end(self) -> None:
@@ -257,6 +352,11 @@ class SALM(LightningModule, HFHubMixin):
             val_losses.append(val_loss)
         self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
 
+        if self._partial_val_audio_losses:
+            for name, vals in self._partial_val_audio_losses.items():
+                val_audio_loss = torch.stack(vals).mean()
+                self.log(f"val_audio_loss_{name}", val_audio_loss, on_epoch=True, sync_dist=True)
+
         accuracies = []
         for name, accs in self._partial_accuracies.items():
             val_acc = torch.stack(accs).mean()
@@ -265,6 +365,7 @@ class SALM(LightningModule, HFHubMixin):
         self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
         self._partial_val_losses.clear()
+        self._partial_val_audio_losses.clear()
         self._partial_accuracies.clear()
 
     def validation_step(self, batch: dict, batch_idx: int):
@@ -275,7 +376,7 @@ class SALM(LightningModule, HFHubMixin):
             forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
             num_frames = (inputs["target_ids"] != -100).long().sum()
             with loss_parallel():
-                loss = (
+                text_loss = (
                     torch.nn.functional.cross_entropy(
                         forward_outputs["logits"].flatten(0, 1),
                         inputs["target_ids"].flatten(0, 1),
@@ -285,6 +386,19 @@ class SALM(LightningModule, HFHubMixin):
                     / num_frames
                 )
 
+            # Audio loss
+            if (
+                self.depthformer is not None
+                and "audio_output_mask" in inputs
+                and "hidden_states" in forward_outputs
+            ):
+                audio_loss = self.depthformer.forward_train(
+                    forward_outputs["hidden_states"],
+                    inputs["target_audio_codes"],
+                    inputs["audio_output_mask"],
+                )
+                self._partial_val_audio_losses[name].append(audio_loss)
+
             preds = forward_outputs["logits"].argmax(dim=-1).view(-1)
             refs = inputs["target_ids"].reshape(-1)
             preds = preds[refs != -100]
@@ -292,7 +406,7 @@ class SALM(LightningModule, HFHubMixin):
             accuracy = preds.eq(refs).float().mean()
 
             self._partial_accuracies[name].append(accuracy)
-            self._partial_val_losses[name].append(loss)
+            self._partial_val_losses[name].append(text_loss)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -429,13 +543,11 @@ class SALM(LightningModule, HFHubMixin):
             audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
             audio_embeds = [audio_embeds[i, :elen] for i, elen in enumerate(audio_embed_lens)]
             # Insert audio embeddings into relevant positions in text embeddings.
-            input_embeds, _, attention_mask = replace_placeholders_and_build_targets(
+            input_embeds, _, attention_mask, _ = replace_placeholders_and_build_targets(
                 input_ids=tokens,
                 embeds=token_embeds,
                 padding_id=self.text_pad_id,
-                placeholder_id=self.audio_locator_tag_id,
-                replacements=audio_embeds,
-                target_ids=None,
+                placeholder_replacement_dict={self.audio_locator_tag_id: audio_embeds},
             )
             answer_tokens = self.llm.generate(
                 inputs_embeds=input_embeds,
@@ -521,6 +633,16 @@ class SALM(LightningModule, HFHubMixin):
         # Fix projection dim for pretrained_weights=False (config output_dim may not match LLM)
         update_perception_output_dim(self)
 
+        # Conditionally instantiate Depthformer for audio output
+        if self.cfg.get("depthformer") is not None:
+            from nemo.collections.speechlm2.modules.depthformer import Depthformer, DepthformerConfig
+
+            df_cfg = DepthformerConfig(
+                llm_hidden_size=self.llm.config.hidden_size,
+                **{k: v for k, v in self.cfg.depthformer.items() if k != "llm_hidden_size"},
+            )
+            self.depthformer = Depthformer(df_cfg).to(dtype=dtype)
+
         # Note: LoRA is deferred — see salm-lora-future-work.md in memory
 
         if device_mesh is None:
@@ -542,6 +664,8 @@ class SALM(LightningModule, HFHubMixin):
         if fsdp_mesh.size() > 1:
             self._use_fsdp = True
             self.perception = fully_shard(self.perception, mesh=fsdp_mesh)
+            if self.depthformer is not None:
+                self.depthformer = fully_shard(self.depthformer, mesh=fsdp_mesh)
 
     @property
     def oomptimizer_schema(self) -> dict:
@@ -569,12 +693,11 @@ def replace_placeholders_and_build_targets(
     input_ids: torch.Tensor,
     embeds: torch.Tensor,
     padding_id: int,
-    placeholder_id: int,
-    replacements: list[torch.Tensor],
+    placeholder_replacement_dict: dict[int, list[torch.Tensor]],
     target_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """Replaces each occurrence of the placeholder_id in input_ids with the corresponding tensor
-    from the replacements list in the embeds tensor, and creates corresponding adjusted target_ids.
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Replaces each occurrence of placeholder token IDs in input_ids with the corresponding
+    tensors from the replacements in the embeds tensor, and creates corresponding adjusted target_ids.
 
     Note: when padding is necessary, we apply left-padding to the examples not to introduce
         anomalies at generation time.
@@ -583,12 +706,13 @@ def replace_placeholders_and_build_targets(
       input_ids (Tensor): shape (batch, sequence_length); input token ids.
       embeds (Tensor): shape (batch, sequence_length, hidden_dim); embeddings for each token.
       padding_id (int): these IDs will be marked as ignore_index in target_ids.
-      placeholder_id (int): an id to be replaced.
-      replacements (list of Tensor): each Tensor has shape (L_i, hidden_dim), with L_i arbitrary.
+      placeholder_replacement_dict (dict): mapping from placeholder_id -> list of replacement
+          tensors. Each replacement tensor has shape (L_i, hidden_dim). Replacements are consumed
+          in order of occurrence within the sequence, independently per placeholder type.
       target_ids (Tensor): shape (batch, sequence_length); target token ids.
 
     Returns:
-      Tuple[Tensor, Tensor, Tensor]:
+      Tuple of four tensors:
         - Tensor of shape (batch, max_new_sequence_length, hidden_dim) corresponding to
           ``embeds`` after replacements.
         - Tensor of shape (batch, max_new_sequence_length) with adjusted target IDs where:
@@ -597,7 +721,14 @@ def replace_placeholders_and_build_targets(
           Will be None if target_ids input was None.
         - Tensor of shape (batch, max_new_sequence_length) with attention padding masks
           updated to account for shape changes due to replacements.
+        - Tensor of shape (batch, max_new_sequence_length) with placeholder tags: for each
+          output position, contains the placeholder_id that produced it, or 0 for non-placeholder
+          positions. Useful for building masks per placeholder type downstream.
     """
+    placeholder_ids_set = set(placeholder_replacement_dict.keys())
+    # Per-placeholder consumption index (global across batch, consumed in sequence order)
+    consumption_idx = {pid: 0 for pid in placeholder_ids_set}
+
     batch_size, seq_len = input_ids.size()
     if target_ids is not None:
         assert target_ids.size() == input_ids.size(), "target_ids must have the same shape as input_ids"
@@ -612,73 +743,81 @@ def replace_placeholders_and_build_targets(
     output_sequences = []
     output_target_ids = []
     output_att_masks = []
-    replacement_idx = 0
+    output_placeholder_tags = []
 
     for i in range(batch_size):
-        # Find all placeholder positions at once using tensor operations
-        placeholder_positions = (input_ids[i] == placeholder_id).nonzero(as_tuple=True)[0]
+        # Find all placeholder positions (for any placeholder type) at once
+        is_placeholder = torch.zeros(input_ids[i].shape[0], dtype=torch.bool, device=device)
+        for pid in placeholder_ids_set:
+            is_placeholder |= (input_ids[i] == pid)
+        placeholder_positions = is_placeholder.nonzero(as_tuple=True)[0]
 
         # Handle the case with no placeholders more efficiently
         if len(placeholder_positions) == 0:
             output_sequences.append(embeds[i])
-
-            # Start with original target_ids and replace positions where input was padding
             if target_ids is not None:
                 new_target_ids = target_ids[i].clone()
                 new_target_ids[input_ids[i] == padding_id] = ignore_index
                 output_target_ids.append(new_target_ids)
             output_att_masks.append(input_ids[i] != padding_id)
+            output_placeholder_tags.append(torch.zeros(input_ids[i].shape[0], dtype=torch.long, device=device))
             continue
 
         # Build segments between placeholders
         segments = []  # For embeddings
         target_segments = []  # For target IDs
         att_masks = []
+        tag_segments = []  # For placeholder tags
         prev_pos = 0
 
         for pos in placeholder_positions:
             # Add segment before placeholder (if any)
             if pos > prev_pos:
                 segments.append(embeds[i][prev_pos:pos])
-
-                # For target IDs: keep original targets but mark positions that were padding in input
                 if target_ids is not None:
                     segment_target_ids = target_ids[i][prev_pos:pos].clone()
                     segment_target_ids[segment_target_ids == padding_id] = ignore_index
                     target_segments.append(segment_target_ids)
                 att_masks.append(input_ids[i][prev_pos:pos] != padding_id)
+                tag_segments.append(torch.zeros(pos - prev_pos, dtype=torch.long, device=device))
 
-            # Add replacement for embeddings
-            rep = replacements[replacement_idx]
+            # Determine which placeholder type this is and get the replacement
+            pid = input_ids[i][pos].item()
+            rep = placeholder_replacement_dict[pid][consumption_idx[pid]]
+            consumption_idx[pid] += 1
+
             segments.append(rep)
-
-            # For target IDs: all replacement positions get ignore_index
             target_segments.append(torch.full((rep.size(0),), ignore_index, dtype=torch.long, device=device))
             att_masks.append(torch.ones((rep.size(0),), dtype=torch.bool, device=device))
+            tag_segments.append(torch.full((rep.size(0),), pid, dtype=torch.long, device=device))
 
-            replacement_idx += 1
             prev_pos = pos + 1  # Skip placeholder
 
         # Add remaining segment after last placeholder (if any)
-        if prev_pos < seq_len:
-            segments.append(embeds[i][prev_pos:seq_len])
-
-            # For target IDs: keep original targets but mark positions that were padding in input
+        remaining_len = input_ids[i].shape[0]
+        if prev_pos < remaining_len:
+            segments.append(embeds[i][prev_pos:remaining_len])
             if target_ids is not None:
-                segment_target_ids = target_ids[i][prev_pos:seq_len].clone()
+                segment_target_ids = target_ids[i][prev_pos:remaining_len].clone()
                 segment_target_ids[segment_target_ids == padding_id] = ignore_index
                 target_segments.append(segment_target_ids)
-            att_masks.append(input_ids[i][prev_pos:seq_len] != padding_id)
+            att_masks.append(input_ids[i][prev_pos:remaining_len] != padding_id)
+            tag_segments.append(torch.zeros(remaining_len - prev_pos, dtype=torch.long, device=device))
 
         # Concatenate all segments for this example
         output_sequences.append(torch.cat(segments, dim=0))
         output_att_masks.append(torch.cat(att_masks, dim=0))
+        output_placeholder_tags.append(torch.cat(tag_segments, dim=0))
         if target_ids is not None:
             output_target_ids.append(torch.cat(target_segments, dim=0))
 
     # Verify all replacements were used
-    if replacement_idx != len(replacements):
-        raise ValueError(f"Expected {len(replacements)} replacements but used {replacement_idx}")
+    for pid, idx in consumption_idx.items():
+        expected = len(placeholder_replacement_dict[pid])
+        if idx != expected:
+            raise ValueError(
+                f"Placeholder {pid}: expected {expected} replacements but used {idx}"
+            )
 
     # Create padded output tensors
     max_seq_length = max(seq.size(0) for seq in output_sequences)
@@ -688,17 +827,21 @@ def replace_placeholders_and_build_targets(
     else:
         new_target_ids = None
     attention_masks = torch.zeros((batch_size, max_seq_length), dtype=torch.bool, device=device)
+    placeholder_tags = torch.zeros((batch_size, max_seq_length), dtype=torch.long, device=device)
 
     if target_ids is None:
         output_target_ids = repeat(None)
-    for i, (seq, tgt, att) in enumerate(zip(output_sequences, output_target_ids, output_att_masks)):
+    for i, (seq, tgt, att, tags) in enumerate(
+        zip(output_sequences, output_target_ids, output_att_masks, output_placeholder_tags)
+    ):
         seq_len = seq.size(0)
         output[i, -seq_len:] = seq
         if tgt is not None:
             new_target_ids[i, -seq_len:] = tgt
         attention_masks[i, -seq_len:] = att
+        placeholder_tags[i, -seq_len:] = tags
 
-    return output, new_target_ids, attention_masks
+    return output, new_target_ids, attention_masks, placeholder_tags
 
 
 def _unpad_inputs(

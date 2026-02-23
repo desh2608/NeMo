@@ -201,12 +201,11 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
         ]
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
-        input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
+        input_embs, target_ids, attention_mask, _ = replace_placeholders_and_build_targets(
             input_ids=batch["input_ids"],
             embeds=text_embs,
             padding_id=self.text_pad_id,
-            placeholder_id=self.audio_locator_tag_id,
-            replacements=audio_embs,
+            placeholder_replacement_dict={self.audio_locator_tag_id: audio_embs},
             target_ids=batch["input_ids"].where(batch["loss_mask"], -100),  # CrossEntropyLoss().ignore_index
         )
         input_embs = input_embs[:, :-1]
@@ -509,13 +508,11 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                 for aemb, aemblen, temb in zip(audio_embeds, audio_embed_lens, transcript_embs)
             ]
             # Insert audio embeddings into relevant positions in text embeddings.
-            input_embeds, _, attention_mask = replace_placeholders_and_build_targets(
+            input_embeds, _, attention_mask, _ = replace_placeholders_and_build_targets(
                 input_ids=tokens,
                 embeds=token_embeds,
                 padding_id=self.text_pad_id,
-                placeholder_id=self.audio_locator_tag_id,
-                replacements=audio_embeds,
-                target_ids=None,
+                placeholder_replacement_dict={self.audio_locator_tag_id: audio_embeds},
             )
         else:
             # Text-only with embeddings - no audio placeholders to replace

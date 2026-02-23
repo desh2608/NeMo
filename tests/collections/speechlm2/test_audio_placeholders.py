@@ -37,12 +37,11 @@ def test_replace_placeholders():
         torch.full((2, 2), fill_value=4.0),
     ]
 
-    embeds_r, targets_r, attention_mask_r = replace_placeholders_and_build_targets(
+    embeds_r, targets_r, attention_mask_r, tags_r = replace_placeholders_and_build_targets(
         input_ids=input_ids,
         embeds=embeds,
         padding_id=PAD,
-        placeholder_id=AUDIO,
-        replacements=replacements,
+        placeholder_replacement_dict={AUDIO: replacements},
         target_ids=input_ids.where(loss_mask, -100)
     )
 
@@ -99,12 +98,11 @@ def test_replace_placeholders_removes_excessive_left_padding():
         torch.full((5, 2), fill_value=4.0),
     ]
 
-    embeds_r, targets_r, attention_mask_r = replace_placeholders_and_build_targets(
+    embeds_r, targets_r, attention_mask_r, tags_r = replace_placeholders_and_build_targets(
         input_ids=input_ids,
         embeds=embeds,
         padding_id=PAD,
-        placeholder_id=AUDIO,
-        replacements=replacements,
+        placeholder_replacement_dict={AUDIO: replacements},
         target_ids=input_ids.where(loss_mask, -100)
     )
 
