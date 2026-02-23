@@ -39,7 +39,11 @@ def train(cfg):
     with trainer.init_module():
         model = SALM(OmegaConf.to_container(cfg.model, resolve=True))
 
-    dataset = SALMDataset(tokenizer=model.tokenizer)
+    dataset_kwargs = {}
+    if cfg.model.get("depthformer") is not None:
+        dataset_kwargs["audio_locator_tag"] = cfg.model.audio_locator_tag
+        dataset_kwargs["audio_out_locator_tag"] = cfg.model.get("audio_out_locator_tag", "<|audio_out|>")
+    dataset = SALMDataset(tokenizer=model.tokenizer, **dataset_kwargs)
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
     trainer.fit(model, datamodule)

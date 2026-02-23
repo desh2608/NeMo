@@ -57,7 +57,7 @@ class SALM(LightningModule, HFHubMixin):
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         special_tokens = [self.audio_locator_tag]
         if self.cfg.get("depthformer") is not None:
-            special_tokens.extend([self.audio_out_locator_tag, "<|audio_start|>", "<|audio_end|>"])
+            special_tokens.append(self.audio_out_locator_tag)
         self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         self.llm = None  # populated by configure_model
         self.perception = None  # populated by configure_model
