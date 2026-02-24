@@ -92,9 +92,7 @@ class HFHubMixin(
         model_kwargs['cfg']['pretrained_weights'] = False
 
         if device_mesh is None:
-            # Non-distributed: build all modules (LLM, perception) during __init__
-            # so that the state dict can be loaded into them.
-            model_kwargs['cfg']['init_configure_model'] = True
+            # Non-distributed: existing flow unchanged
             if torch_dtype is not None:
                 model_kwargs['cfg']['torch_dtype'] = (
                     torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype).replace("torch.", "")

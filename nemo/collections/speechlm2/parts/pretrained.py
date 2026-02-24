@@ -188,6 +188,10 @@ def _setup_from_extracted(model: torch.nn.Module):
         f"Loaded extracted encoder: {len(encoder_state)} keys, "
         f"{len(result.missing_keys)} missing, {len(result.unexpected_keys)} unexpected"
     )
+    if result.missing_keys:
+        logging.warning(f"Encoder missing keys: {result.missing_keys}")
+    if result.unexpected_keys:
+        logging.warning(f"Encoder unexpected keys: {result.unexpected_keys}")
 
     # 4. Optionally load projection
     pretrained_proj = getattr(model.cfg, "pretrained_proj", None)
@@ -204,6 +208,15 @@ def _setup_from_extracted(model: torch.nn.Module):
         proj_state = _load_safetensors_dir(pretrained_proj)
         model.perception.proj.load_state_dict(proj_state)
         logging.info(f"Loaded extracted projection: {len(proj_state)} keys")
+
+        # Persist SoundProjection dimensions so from_pretrained can reconstruct it
+        with open_dict(model.cfg):
+            model.cfg.sound_projection = {
+                "sound_hidden_size": proj_config["hidden_size"],
+                "projection_hidden_size": proj_config["projection_hidden_size"],
+                "llm_hidden_size": llm_hidden_size,
+                "bias": proj_config.get("projection_bias", False),
+            }
 
 
 def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
@@ -227,6 +240,11 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
             model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
+        # Reconstruct SoundProjection if config indicates one was used during export
+        sound_proj = getattr(model.cfg, "sound_projection", None)
+        if sound_proj:
+            sound_proj = OmegaConf.to_container(sound_proj) if isinstance(sound_proj, DictConfig) else sound_proj
+            model.perception.proj = SoundProjection(**sound_proj)
 
 
 def set_model_dict_for_partial_init(

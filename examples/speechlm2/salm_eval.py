@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Optional
 
@@ -122,6 +123,7 @@ def main(cfg: SalmEvalConfig):
 
     refs = []
     hyps = []
+    eval_cuts = []
     input_durations = []
     infer_durations = []
     for batch_idx, batch in enumerate(dloader):
@@ -152,20 +154,39 @@ def main(cfg: SalmEvalConfig):
                 f"Batch {batch_idx}: WER={batch_wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}] RTFx={batch_rtfx:.1f}"
             )
 
+        eval_cuts.extend(batch["cuts"])
         refs.extend(batch_refs)
         hyps.extend(batch_hyps)
         input_durations.append(batch_duration)
         infer_durations.append(batch_infer_duration)
 
-    wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
-    rtfx = sum(input_durations) / sum(infer_durations)
-    logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
-    logging.info(f"RTFx: {rtfx:.1f}")
+    dist_initialized = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if dist_initialized else 0
+    world_size = torch.distributed.get_world_size() if dist_initialized else 1
+
+    if rank == 0:
+        wer, _, nins, ndel, nsub = word_error_rate_detail(hypotheses=hyps, references=refs, use_cer=False)
+        rtfx = sum(input_durations) / sum(infer_durations)
+        logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
+        logging.info(f"RTFx: {rtfx:.1f}")
 
     if cfg.output_manifest is not None:
-        with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for cut, ref, hyp in zip(cuts, refs, hyps):
+        # Each rank writes its own shard
+        rank_path = f"{cfg.output_manifest}.rank{rank}" if world_size > 1 else cfg.output_manifest
+        with SequentialJsonlWriter(rank_path) as writer:
+            for cut, ref, hyp in zip(eval_cuts, refs, hyps):
                 writer.write({"id": cut.id, "duration": cut.duration, "text": ref, "pred_text": hyp})
+
+        # Rank 0 merges all rank files into the final output
+        if world_size > 1:
+            torch.distributed.barrier()
+            if rank == 0:
+                with open(cfg.output_manifest, "w") as out:
+                    for r in range(world_size):
+                        rp = Path(f"{cfg.output_manifest}.rank{r}")
+                        if rp.exists():
+                            out.write(rp.read_text())
+                            rp.unlink()
 
 
 def parse_hyp(answer: torch.Tensor, eos_tokens: list[int]):
