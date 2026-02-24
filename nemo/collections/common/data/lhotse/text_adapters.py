@@ -431,8 +431,8 @@ def collate_conversation_audio_fault_tolerant(
                     cut = cut.to_mono(mono_downmix=True)
                 conv_audios.append(torch.as_tensor(cut.load_audio()).squeeze())
                 conv_cuts.append(cut)
-        except AudioLoadingError:
-            logging.warning(f"Skipping conversation because it failed to load audio: {conversation.to_dict()}")
+        except AudioLoadingError as ex:
+            logging.warning(f"Skipping conversation {conversation.id} because it failed to load audio: {ex}")
             continue
         else:
             audios.extend(conv_audios)
