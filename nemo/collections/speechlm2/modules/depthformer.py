@@ -209,7 +209,7 @@ class DepthformerConfig:
     depthformer_gqa_dim: int = 8
     tie_embeddings: bool = True
     codebook_weight_schedule: str = "log"  # "log" or "linear"
-    semantic_codebook_factor: float = 0.5
+    semantic_codebook_factor: float = 100.0
     pretrained_depthformer: str | None = None  # path to extracted depthformer weights
 
 
