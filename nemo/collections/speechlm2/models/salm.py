@@ -63,6 +63,21 @@ class SALM(LightningModule, HFHubMixin):
             self.configure_model()
 
     @property
+    def device(self) -> torch.device:
+        """Return the device of this model.
+
+        Overrides LightningModule.device which relies on ``_device`` being set
+        via ``.to(device)`` — that never happens in the distributed
+        ``from_pretrained`` path (DTensor models can't be ``.to()``'d).
+        Instead, derive the device from the LLM's first parameter.
+        """
+        if self.llm is not None:
+            p = next(self.llm.parameters(), None)
+            if p is not None:
+                return p.device
+        return super().device
+
+    @property
     def embed_tokens(self):
         """Navigate to the LLM's embedding layer (kept inside the LLM)."""
         if self.llm is None:
