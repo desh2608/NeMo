@@ -52,12 +52,14 @@ class SALM(LightningModule, HFHubMixin):
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
         self.audio_out_locator_tag = self.cfg.get("audio_out_locator_tag", "<|audio_out|>")
+        self.audio_start_tag = self.cfg.get("audio_start_tag", "<|audio_start|>")
         self.audio_loss_weight = self.cfg.get("audio_loss_weight", 1.0)
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         special_tokens = [self.audio_locator_tag]
         if self.cfg.get("depthformer") is not None:
             special_tokens.append(self.audio_out_locator_tag)
+            special_tokens.append(self.audio_start_tag)
         self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         self.llm = None  # populated by configure_model
         self.perception = None  # populated by configure_model
@@ -125,6 +127,10 @@ class SALM(LightningModule, HFHubMixin):
     @property
     def audio_out_locator_tag_id(self) -> int:
         return self.tokenizer.token_to_id(self.audio_out_locator_tag)
+
+    @property
+    def audio_start_tag_id(self) -> int:
+        return self.tokenizer.token_to_id(self.audio_start_tag)
 
     @property
     def token_equivalent_duration(self) -> float:
@@ -220,10 +226,15 @@ class SALM(LightningModule, HFHubMixin):
                 batch["target_audios"], batch["target_audio_lens"],
                 source_sample_rate=self.sampling_rate,
             )
+            eoaudio_id = self.cfg.depthformer.audio_vocab_size - 1  # EOAudio token
+            K = self.cfg.depthformer.num_codebooks
             audio_out_embs = []
             for j in range(codes.shape[0]):
                 T_frames = code_lens[j].item()
                 codes_j = codes[j, :, :T_frames].T  # (T_frames, K)
+                # Append EOAudio end frame (all K codebooks = eoaudio_id)
+                eoaudio_frame = torch.full((1, K), eoaudio_id, dtype=codes_j.dtype, device=codes_j.device)
+                codes_j = torch.cat([codes_j, eoaudio_frame], dim=0)  # (T_frames+1, K)
                 target_audio_codes_list.append(codes_j)
                 # Shifted codes for teacher forcing: first frame gets zeros
                 shifted = torch.zeros_like(codes_j)

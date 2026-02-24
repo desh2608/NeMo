@@ -821,6 +821,152 @@ def read_lhotse_magpietts_data_as_s2s_duplex(config) -> Tuple[CutSet, bool]:
     return cuts, is_tarred
 
 
+def magpietts_cut_to_conversation(
+    cut: Cut,
+    audio_locator_tag: str,
+    token_equivalent_duration: float,
+    sample_rate: int = 16000,
+    system_prompt: str = "Follow the instruction by the user. If you generate audio, it should sound like this reference audio:",
+    user_prompt_template: str = "Generate speech from the following text: {text}",
+) -> NeMoMultimodalConversation:
+    """
+    Converts a raw MagpieTTS cut into a 4-turn NeMoMultimodalConversation for TTS training
+    with depthformer.
+
+    The conversation structure is:
+        TextTurn(role="system")     — system prompt with reference audio instruction
+        AudioTurn(role="system")    — context_audio (speaker reference) → perception/ASR encoder
+        TextTurn(role="user")       — "Generate speech from the following text: {text}"
+        AudioTurn(role="assistant") — target_audio (speech to generate) → Mimi/depthformer
+
+    After prompt formatting, this produces:
+        system: <system_prompt> <|audio|>
+        user: Generate speech from the following text: {text}
+        assistant: <|audio|>
+
+    ``_expand_assistant_audio`` classifies AudioTurns by role: system/user AudioTurns go to
+    ``audios`` (perception encoder), assistant AudioTurns go to ``target_audios`` (depthformer).
+    """
+    if isinstance(cut, NeMoMultimodalConversation):
+        return cut
+
+    reference_text = cut.supervisions[0].text
+
+    # Resample context and target audio to match ASR encoder sample rate
+    context_recording = cut.context_audio.resample(sample_rate)
+    target_recording = cut.target_audio.resample(sample_rate)
+
+    # Wrap recordings in MonoCut objects (required by AudioTurn.cut)
+    context_cut = MonoCut(
+        id=f"{cut.id}_context",
+        start=0.0,
+        duration=context_recording.duration,
+        channel=0,
+        recording=context_recording,
+        supervisions=[],
+    )
+    target_cut = MonoCut(
+        id=f"{cut.id}_target",
+        start=0.0,
+        duration=target_recording.duration,
+        channel=0,
+        recording=target_recording,
+        supervisions=[],
+    )
+
+    turns = [
+        TextTurn(value=system_prompt, role="system"),
+        AudioTurn(cut=context_cut, role="system", audio_locator_tag=audio_locator_tag),
+        TextTurn(value=user_prompt_template.format(text=reference_text), role="user"),
+        AudioTurn(cut=target_cut, role="assistant", audio_locator_tag=audio_locator_tag),
+    ]
+
+    return NeMoMultimodalConversation(
+        id=cut.id,
+        turns=turns,
+        token_equivalent_duration=token_equivalent_duration,
+        custom=cut.custom,
+    )
+
+
+@data_type_parser(["magpietts_as_conversation"])
+def read_magpietts_as_conversation(config) -> tuple[CutSet, bool]:
+    """
+    Conversion parser for MagpieTTS data into NeMoMultimodalConversation for TTS training
+    with depthformer.
+
+    Reads raw MagpieTTS cuts (with ``target_audio``, ``context_audio`` Recording attributes
+    and ``supervisions[0].text`` as reference text) and converts them into 4-turn conversations:
+
+        system: <instruction> <|audio|>     (context_audio → perception encoder)
+        user: Generate speech from: {text}
+        assistant: <|audio|>                (target_audio → depthformer)
+
+    Config options:
+        - sample_rate (int): Target sample rate for resampling (default: 16000).
+        - system_prompt (str): System instruction text.
+        - user_prompt_template (str): User prompt template with ``{text}`` placeholder.
+        - max_cer (float): Maximum allowed character error rate (default: 0.03).
+        - min_context_speaker_similarity (float): Minimum speaker similarity (default: 0.6).
+        - target_speaker (str, optional): Target speaker filter.
+        - tags (dict, optional): Extra tags to attach to each cut.
+    """
+    cuts, is_tarred = read_cutset_from_config(config)
+
+    sample_rate = config.get("sample_rate", 16000)
+    max_cer = config.get("max_cer", 0.03)
+    min_context_speaker_similarity = config.get("min_context_speaker_similarity", 0.6)
+    target_speaker = config.get("target_speaker", None)
+    keep_flag = "pass"
+    system_prompt = config.get(
+        "system_prompt",
+        "Follow the instruction by the user. If you generate audio, it should sound like this reference audio:",
+    )
+    user_prompt_template = config.get("user_prompt_template", "Generate speech from the following text: {text}")
+
+    # Filters (same as lhotse_magpietts_data_as_continuation)
+    def filter_cer_fn(cut: Cut) -> bool:
+        return (
+            len(cut.supervisions) == 0
+            or not cut.supervisions[0].has_custom("cer")
+            or cut.supervisions[0].cer <= max_cer
+        )
+
+    def filter_val_flag_fn(cut: Cut) -> bool:
+        return not cut.has_custom("validation_status") or cut.validation_status == keep_flag
+
+    def filter_secs_fn(cut: Cut) -> bool:
+        return (
+            len(cut.supervisions) == 0
+            or not cut.supervisions[0].has_custom("context_speaker_similarity")
+            or cut.supervisions[0].context_speaker_similarity >= min_context_speaker_similarity
+        )
+
+    def filter_target_speaker_fn(cut: Cut) -> bool:
+        return len(cut.supervisions) == 0 or target_speaker is None or target_speaker in cut.supervisions[0].speaker
+
+    # Apply filters
+    cuts = cuts.filter(filter_cer_fn).filter(filter_val_flag_fn).filter(filter_secs_fn).filter(filter_target_speaker_fn)
+
+    # Attach extra tags if provided
+    if (extra_tags := config.get("tags")) is not None:
+        cuts = cuts.map(partial(attach_tags, tags=extra_tags), apply_fn=None)
+
+    # Convert to NeMoMultimodalConversation
+    cuts = cuts.map(
+        partial(
+            magpietts_cut_to_conversation,
+            audio_locator_tag=config.audio_locator_tag,
+            token_equivalent_duration=config.token_equivalent_duration,
+            sample_rate=sample_rate,
+            system_prompt=system_prompt,
+            user_prompt_template=user_prompt_template,
+        )
+    )
+
+    return cuts, is_tarred
+
+
 @data_type_parser(["lhotse_as_conversation"])
 def read_lhotse_as_conversation(config) -> tuple[CutSet, bool]:
     """

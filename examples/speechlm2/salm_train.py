@@ -43,6 +43,7 @@ def train(cfg):
     if cfg.model.get("depthformer") is not None:
         dataset_kwargs["audio_locator_tag"] = cfg.model.audio_locator_tag
         dataset_kwargs["audio_out_locator_tag"] = cfg.model.get("audio_out_locator_tag", "<|audio_out|>")
+        dataset_kwargs["audio_start_tag"] = cfg.model.get("audio_start_tag", "<|audio_start|>")
     dataset = SALMDataset(tokenizer=model.tokenizer, **dataset_kwargs)
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

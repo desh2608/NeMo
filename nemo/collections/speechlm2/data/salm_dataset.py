@@ -83,11 +83,13 @@ class SALMDataset(torch.utils.data.Dataset):
         tokenizer: AutoTokenizer,
         audio_locator_tag: str | None = None,
         audio_out_locator_tag: str | None = None,
+        audio_start_tag: str | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.pad_id = get_pad_id(tokenizer)
         self.audio_locator_tag = audio_locator_tag
         self.audio_out_locator_tag = audio_out_locator_tag
+        self.audio_start_tag = audio_start_tag
 
     def __getitem__(self, conversations: CutSet) -> dict | None:
         # Note: the function call below may filter out some or all conversations due to audio loading issues.
@@ -194,6 +196,25 @@ class SALMDataset(torch.utils.data.Dataset):
         # Swap assistant placeholders to audio_out_locator_tag.
         for audio_idx in assistant_audio_indices:
             input_ids[placeholder_positions[audio_idx]] = audio_out_id
+
+        # Insert <|audio_start|> before each assistant audio placeholder.
+        if self.audio_start_tag is not None and assistant_audio_indices:
+            audio_start_id = self.tokenizer.token_to_id(self.audio_start_tag)
+            # Recalculate placeholder positions after the swap (values changed but positions didn't).
+            assistant_positions = sorted([placeholder_positions[idx] for idx in assistant_audio_indices])
+            # Build new tensors with <|audio_start|> inserted before each assistant audio.
+            new_ids_parts, new_mask_parts = [], []
+            prev = 0
+            for pos in assistant_positions:
+                new_ids_parts.append(input_ids[prev:pos])
+                new_mask_parts.append(mask[prev:pos])
+                new_ids_parts.append(torch.tensor([audio_start_id], dtype=input_ids.dtype))
+                new_mask_parts.append(mask[pos : pos + 1])  # same mask as audio placeholder (True)
+                prev = pos
+            new_ids_parts.append(input_ids[prev:])
+            new_mask_parts.append(mask[prev:])
+            input_ids = torch.cat(new_ids_parts)
+            mask = torch.cat(new_mask_parts)
 
         return input_ids, mask, user_audio_indices, assistant_audio_indices
 
