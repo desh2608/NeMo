@@ -457,6 +457,7 @@ class SALM(LightningModule, HFHubMixin):
         audios: torch.Tensor = None,
         audio_lens: torch.Tensor = None,
         generation_config: GenerationConfig = None,
+        enable_thinking: bool = False,
         **generation_kwargs,
     ) -> torch.Tensor:
         """
@@ -535,7 +536,7 @@ class SALM(LightningModule, HFHubMixin):
                 audios, audio_lens = maybe_audio
             formatter = PromptFormatter.resolve(self.cfg.prompt_format)(self.tokenizer)
             tokens = left_collate_vectors(
-                [formatter.encode_dialog(turns=prompt)["input_ids"] for prompt in prompts],
+                [formatter.encode_dialog(turns=prompt, enable_thinking=enable_thinking)["input_ids"] for prompt in prompts],
                 padding_value=self.text_pad_id,
             ).to(self.device)
         if generation_config is None:
@@ -549,6 +550,7 @@ class SALM(LightningModule, HFHubMixin):
             # Prepare token embeddings and audio embeddings.
             tokens_to_embed = tokens.where(tokens != self.audio_locator_tag_id, 0)
             token_embeds = self._embed_tokens(tokens_to_embed)
+            tokens = tokens.to(token_embeds.device)
             # TODO: temporary workaround to perform batch_size=1 inference for audio encoder
             #   due to accuracy issues at bs>1
             audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
