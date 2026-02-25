@@ -28,6 +28,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from nemo.utils import logging
 
@@ -186,10 +187,17 @@ class SharedEmbedding(nn.Module):
             nn.init.normal_(self.to_logits.weight, mean=0.0, std=std)
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.embedding(tokens)
+        weight = self.embedding.weight
+        if isinstance(weight, DTensor):
+            weight = weight.full_tensor()
+        return F.embedding(tokens, weight)
 
     def get_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.to_logits(self.embedding_norm(hidden))
+        hidden = self.embedding_norm(hidden)
+        weight = self.to_logits.weight
+        if isinstance(weight, DTensor):
+            weight = weight.full_tensor()
+        return F.linear(hidden, weight)
 
 
 # ---------------------------------------------------------------------------
