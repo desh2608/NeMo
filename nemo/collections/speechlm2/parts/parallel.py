@@ -70,7 +70,7 @@ class AutomodelParallelStrategy(ModelParallelStrategy):
 
     This is a drop-in replacement for ``ModelParallelStrategy`` that delegates
     device mesh creation to
-    ``nemo_automodel.components.distributed.device_mesh.create_device_mesh``.
+    ``nemo_automodel.components.distributed.mesh_utils.create_device_mesh``.
 
     The resulting device mesh has dimensions ``(pp, dp_replicate, dp_shard, cp, tp)``
     with flattened submeshes ``dp``, ``dp_shard_cp``, and ``dp_cp``.
@@ -156,7 +156,7 @@ class AutomodelParallelStrategy(ModelParallelStrategy):
             Tuple of ``(device_mesh, moe_mesh)``.
         """
         from nemo_automodel.components.distributed.config import FSDP2Config
-        from nemo_automodel.components.distributed.device_mesh import create_device_mesh
+        from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
         if self._distributed_config is None:
             self._distributed_config = FSDP2Config()

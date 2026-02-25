@@ -181,15 +181,12 @@ class SALM(LightningModule, HFHubMixin):
             output_hidden_states=need_hidden_states,
             return_dict=True,
         )
-        if not isinstance(out, dict):
-            # NeMo Automodel doesn't respect return_dict=True yet
-            ans = {"logits": out}
-        else:
-            ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
-            if cache is not None:
-                ans["cache"] = out["past_key_values"]
-            if need_hidden_states and "hidden_states" in out:
-                ans["hidden_states"] = out["hidden_states"][-1]  # last layer
+
+        ans = {"logits": out.logits}
+        if cache is not None and out.past_key_values is not None:
+            ans["cache"] = out.past_key_values
+        if need_hidden_states and out.hidden_states is not None:
+            ans["hidden_states"] = out.hidden_states[-1]  # last layer
         return ans
 
     def prepare_inputs(self, batch: dict):
