@@ -325,7 +325,7 @@ class Depthformer(nn.Module):
             new_cache.append(c)
         return x, new_cache
 
-    def forward_train(
+    def forward(
         self,
         llm_hidden_states: torch.Tensor,
         target_audio_codes: torch.Tensor,

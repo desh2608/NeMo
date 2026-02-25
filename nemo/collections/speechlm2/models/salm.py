@@ -322,7 +322,7 @@ class SALM(LightningModule, HFHubMixin):
             and "audio_output_mask" in inputs
             and "hidden_states" in forward_outputs
         ):
-            audio_loss = self.depthformer.forward_train(
+            audio_loss = self.depthformer(
                 forward_outputs["hidden_states"],
                 inputs["target_audio_codes"],
                 inputs["audio_output_mask"],
@@ -403,7 +403,7 @@ class SALM(LightningModule, HFHubMixin):
                 and "audio_output_mask" in inputs
                 and "hidden_states" in forward_outputs
             ):
-                audio_loss = self.depthformer.forward_train(
+                audio_loss = self.depthformer(
                     forward_outputs["hidden_states"],
                     inputs["target_audio_codes"],
                     inputs["audio_output_mask"],
