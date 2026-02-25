@@ -92,12 +92,7 @@ class MimiTokenizer:
         """Number of audio samples per codec frame."""
         if self._model is not None:
             cfg = self._model.config
-            # frame_size = product of upsampling_ratios * hop_length
-            import math
-            frame_size = cfg.hop_length
-            for r in cfg.upsampling_ratios:
-                frame_size *= r
-            return frame_size
+            return int(cfg.sampling_rate / cfg.frame_rate)
         # Fallback: 24000 / 12.5 = 1920
         return 1920
 
