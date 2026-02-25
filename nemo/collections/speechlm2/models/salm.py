@@ -317,12 +317,14 @@ class SALM(LightningModule, HFHubMixin):
 
         # Audio loss via depthformer
         audio_loss = text_loss.new_tensor(0.0)
-        if (
+        audio_metrics = {}
+        has_audio_output = (
             self.depthformer is not None
             and "audio_output_mask" in inputs
             and "hidden_states" in forward_outputs
-        ):
-            audio_loss = self.depthformer(
+        )
+        if has_audio_output:
+            audio_loss, audio_metrics = self.depthformer(
                 forward_outputs["hidden_states"],
                 inputs["target_audio_codes"],
                 inputs["audio_output_mask"],
@@ -334,6 +336,8 @@ class SALM(LightningModule, HFHubMixin):
             print(f'text_loss={text_loss.detach().cpu().item():.4f} audio_loss={audio_loss.detach().cpu().item():.4f}')
 
         B, T = inputs["input_embeds"].shape[:2]
+        audio_frames_count = inputs["audio_output_mask"].sum().float() if has_audio_output else text_loss.new_tensor(0.0)
+        text_frames_count = num_frames.float() - audio_frames_count
         ans = {
             "loss": loss,
             "text_loss": text_loss,
@@ -346,6 +350,11 @@ class SALM(LightningModule, HFHubMixin):
             "num_frames": num_frames.to(torch.float32),  # avoid warning
             "target_to_input_ratio": num_frames / (B * T),
             "padding_ratio": (batch["input_ids"] != self.text_pad_id).long().sum() / batch["input_ids"].numel(),
+            "audio_frames_count": audio_frames_count,
+            "text_frames_count": text_frames_count,
+            "audio_frames_ratio": audio_frames_count / (B * T),
+            "audio_loss_weight_effective": (self.audio_loss_weight * audio_loss / loss).detach() if loss > 0 else text_loss.new_tensor(0.0),
+            **audio_metrics,
         }
         self.log_dict(ans, on_step=True)
         return ans
@@ -403,7 +412,7 @@ class SALM(LightningModule, HFHubMixin):
                 and "audio_output_mask" in inputs
                 and "hidden_states" in forward_outputs
             ):
-                audio_loss = self.depthformer(
+                audio_loss, _ = self.depthformer(
                     forward_outputs["hidden_states"],
                     inputs["target_audio_codes"],
                     inputs["audio_output_mask"],
@@ -427,6 +436,24 @@ class SALM(LightningModule, HFHubMixin):
 
     def test_step(self, *args: Any, **kwargs: Any):
         return self.validation_step(*args, **kwargs)
+
+    @torch.no_grad()
+    def on_before_optimizer_step(self, optimizer, *args, **kwargs):
+        """Log per-component gradient norms before the optimizer step."""
+        def _grad_norm(params):
+            grads = [p.grad.float() for p in params if p.grad is not None]
+            if not grads:
+                return torch.tensor(0.0, device=self.device)
+            return torch.stack([g.norm() for g in grads]).norm()
+
+        metrics = {
+            "grad_norm_llm": _grad_norm(self.llm.parameters()),
+            "grad_norm_perception": _grad_norm(self.perception.parameters()),
+        }
+        if self.depthformer is not None:
+            metrics["grad_norm_depthformer"] = _grad_norm(self.depthformer.parameters())
+            metrics["grad_norm_depth_linear"] = _grad_norm(self.depthformer.depth_linear.parameters())
+        self.log_dict(metrics, on_step=True)
 
     def backward(self, *args, **kwargs):
         with loss_parallel():

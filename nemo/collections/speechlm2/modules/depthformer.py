@@ -330,7 +330,7 @@ class Depthformer(nn.Module):
         llm_hidden_states: torch.Tensor,
         target_audio_codes: torch.Tensor,
         audio_output_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict]:
         """
         Compute audio loss during training with teacher forcing.
 
@@ -341,7 +341,8 @@ class Depthformer(nn.Module):
             audio_output_mask: (B, T) boolean mask indicating audio output positions
 
         Returns:
-            Scalar audio loss (weighted sum over codebooks)
+            total_loss: Scalar audio loss (weighted sum over codebooks)
+            metrics: Dict of per-codebook losses and codebook-0 accuracy
         """
         K = self.cfg.num_codebooks
 
@@ -350,7 +351,7 @@ class Depthformer(nn.Module):
         targets = target_audio_codes[audio_output_mask]  # (N, K)
 
         if h.shape[0] == 0:
-            return h.new_tensor(0.0)
+            return h.new_tensor(0.0), {}
 
         # Project to per-codebook inputs: (N, K*D) -> (N, K, D)
         df_in = self.depth_linear(h).reshape(-1, K, self.cfg.depthformer_dim)
@@ -358,17 +359,23 @@ class Depthformer(nn.Module):
         # Sequential codebook prediction with teacher forcing
         prev_emb = torch.zeros_like(df_in[:, 0])  # (N, D)
         total_loss = h.new_tensor(0.0)
+        metrics = {}
 
         for i in range(K):
             cur_input = (df_in[:, i] + prev_emb).unsqueeze(1)  # (N, 1, D)
             df_out, _ = self._run_depthformer(cur_input)  # (N, 1, D)
             logits = self.depth_embeddings[i].get_logits(df_out.squeeze(1))  # (N, V)
             loss_i = F.cross_entropy(logits, targets[:, i])
-            total_loss = total_loss + self.audio_loss_weights[i] * loss_i
+            weighted_loss_i = self.audio_loss_weights[i] * loss_i
+            total_loss = total_loss + weighted_loss_i
+            metrics[f"audio_loss_cb{i}"] = loss_i.detach()
+            metrics[f"audio_loss_cb{i}_weighted"] = weighted_loss_i.detach()
+            if i == 0:
+                metrics["audio_acc_cb0"] = (logits.detach().argmax(-1) == targets[:, 0]).float().mean()
             # Teacher forcing: embed the ground-truth target
             prev_emb = self.depth_embeddings[i].embed(targets[:, i])  # (N, D)
 
-        return total_loss
+        return total_loss, metrics
 
     @torch.no_grad()
     def forward_inference(
