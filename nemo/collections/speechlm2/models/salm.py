@@ -213,10 +213,18 @@ class SALM(LightningModule, HFHubMixin):
         # Source audio encoding.
         # Input audio: (B, T_samples)
         # Audio embeddings: (B, T, H)
-        audio_embs, audio_emb_lens = self.perception(
-            input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
+        has_source_audio = (
+            "audios" in batch
+            and batch["audios"] is not None
+            and batch["audios"].shape[-1] > 0
         )
-        audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
+        if has_source_audio:
+            audio_embs, audio_emb_lens = self.perception(
+                input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
+            )
+            audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
+        else:
+            audio_embs = []
 
         # Build the placeholder replacement dict
         placeholder_dict = {self.audio_locator_tag_id: audio_embs}
