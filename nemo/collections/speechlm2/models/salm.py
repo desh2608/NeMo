@@ -244,7 +244,7 @@ class SALM(LightningModule, HFHubMixin):
                 source_sample_rate=target_sr,
             )
             # ctx_embeddings: (B, 512, T_frames) → project to LLM hidden size
-            ctx_embs = self.context_audio_projection(ctx_embeddings.transpose(1, 2))  # (B, T_frames, H)
+            ctx_embs = self.context_audio_projection(ctx_embeddings.transpose(1, 2).to(dtype=self.context_audio_projection.weight.dtype))  # (B, T_frames, H)
             ctx_embs = [emb[:flen] for emb, flen in zip(ctx_embs, ctx_frame_lens)]
             placeholder_dict[self.context_audio_locator_tag_id] = ctx_embs
 
