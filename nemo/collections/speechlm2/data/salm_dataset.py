@@ -84,12 +84,14 @@ class SALMDataset(torch.utils.data.Dataset):
         audio_locator_tag: str | None = None,
         audio_out_locator_tag: str | None = None,
         audio_start_tag: str | None = None,
+        context_audio_locator_tag: str | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.pad_id = get_pad_id(tokenizer)
         self.audio_locator_tag = audio_locator_tag
         self.audio_out_locator_tag = audio_out_locator_tag
         self.audio_start_tag = audio_start_tag
+        self.context_audio_locator_tag = context_audio_locator_tag
 
     def __getitem__(self, conversations: CutSet) -> dict | None:
         # Note: the function call below may filter out some or all conversations due to audio loading issues.
@@ -117,21 +119,26 @@ class SALMDataset(torch.utils.data.Dataset):
                 "conversations": drop_in_memory_data(conversations),
             }
 
-        # S2S mode: separate user/assistant audio, expand assistant audio placeholders.
+        # S2S mode: separate context/user/assistant audio, expand audio placeholders.
         all_input_ids = []
         all_masks = []
         user_audio_global = []
         target_audio_global = []
+        context_audio_global = []
         audio_offset = 0
 
         for conv in conversations:
-            new_ids, new_mask, user_indices, assistant_indices = self._expand_assistant_audio(conv)
+            new_ids, new_mask, user_indices, assistant_indices, context_indices = (
+                self._expand_assistant_audio(conv)
+            )
             all_input_ids.append(new_ids)
             all_masks.append(new_mask)
             for idx in user_indices:
                 user_audio_global.append(audio_offset + idx)
             for idx in assistant_indices:
                 target_audio_global.append(audio_offset + idx)
+            for idx in context_indices:
+                context_audio_global.append(audio_offset + idx)
             audio_offset += sum(1 for t in conv.turns if isinstance(t, AudioTurn))
 
         result = {
@@ -151,41 +158,54 @@ class SALMDataset(torch.utils.data.Dataset):
             result["target_audios"] = audios[target_audio_global]
             result["target_audio_lens"] = audio_lens[target_audio_global]
 
+        if context_audio_global:
+            result["context_audios"] = audios[context_audio_global]
+            result["context_audio_lens"] = audio_lens[context_audio_global]
+
         return result
 
     def _expand_assistant_audio(
         self, conv: NeMoMultimodalConversation
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
-        """Swap assistant AudioTurn placeholders from ``audio_locator_tag`` to ``audio_out_locator_tag``.
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int], list[int]]:
+        """Swap audio placeholders based on turn role.
 
-        User AudioTurns keep the original ``audio_locator_tag`` placeholder.
-        The model's ``prepare_inputs`` expands each ``<|audio_out|>`` to N frames
-        (same mechanism as ``<|audio|>``).
+        - Assistant AudioTurns: ``<|audio|>`` → ``<|audio_out|>`` (depthformer target)
+        - System AudioTurns (when ``context_audio_locator_tag`` is set): ``<|audio|>`` → ``<|context_audio|>`` (Mimi continuous encoder)
+        - User AudioTurns: keep ``<|audio|>`` (perception encoder)
 
         Returns:
             new_input_ids: 1-D int tensor with swapped tokens.
             new_mask: 1-D mask tensor (unchanged).
             user_audio_indices: indices (into the conversation's audio turn list) for user audio.
             assistant_audio_indices: indices for assistant audio.
+            context_audio_indices: indices for context audio (system-role AudioTurns).
         """
         input_ids = torch.as_tensor(conv.input_ids).clone()
         mask = torch.as_tensor(getattr(conv, "mask", torch.zeros_like(input_ids)))
 
         audio_locator_id = self.tokenizer.token_to_id(self.audio_locator_tag)
         audio_out_id = self.tokenizer.token_to_id(self.audio_out_locator_tag)
+        context_audio_id = (
+            self.tokenizer.token_to_id(self.context_audio_locator_tag)
+            if self.context_audio_locator_tag is not None
+            else None
+        )
 
         # Classify each AudioTurn by role.
         audio_turns = [t for t in conv.turns if isinstance(t, AudioTurn)]
         user_audio_indices = []
         assistant_audio_indices = []
+        context_audio_indices = []
         for audio_idx, turn in enumerate(audio_turns):
             if turn.role == "assistant":
                 assistant_audio_indices.append(audio_idx)
+            elif turn.role == "system" and context_audio_id is not None:
+                context_audio_indices.append(audio_idx)
             else:
                 user_audio_indices.append(audio_idx)
 
-        if not assistant_audio_indices:
-            return input_ids, mask, user_audio_indices, assistant_audio_indices
+        if not assistant_audio_indices and not context_audio_indices:
+            return input_ids, mask, user_audio_indices, assistant_audio_indices, context_audio_indices
 
         # Find placeholder positions in input_ids (one per AudioTurn, in order).
         placeholder_positions = (input_ids == audio_locator_id).nonzero(as_tuple=True)[0].tolist()
@@ -196,6 +216,10 @@ class SALMDataset(torch.utils.data.Dataset):
         # Swap assistant placeholders to audio_out_locator_tag.
         for audio_idx in assistant_audio_indices:
             input_ids[placeholder_positions[audio_idx]] = audio_out_id
+
+        # Swap system/context placeholders to context_audio_locator_tag.
+        for audio_idx in context_audio_indices:
+            input_ids[placeholder_positions[audio_idx]] = context_audio_id
 
         # Insert <|audio_start|> before each assistant audio placeholder.
         if self.audio_start_tag is not None and assistant_audio_indices:
@@ -216,7 +240,7 @@ class SALMDataset(torch.utils.data.Dataset):
             input_ids = torch.cat(new_ids_parts)
             mask = torch.cat(new_mask_parts)
 
-        return input_ids, mask, user_audio_indices, assistant_audio_indices
+        return input_ids, mask, user_audio_indices, assistant_audio_indices, context_audio_indices
 
 
 def left_collate_vectors(

@@ -54,6 +54,7 @@ class SALM(LightningModule, HFHubMixin):
         self.audio_out_locator_tag = self.cfg.get("audio_out_locator_tag", "<|audio_out|>")
         self.audio_start_tag = self.cfg.get("audio_start_tag", "<SPECIAL_18>")
         self.audio_loss_weight = self.cfg.get("audio_loss_weight", 1.0)
+        self.context_audio_locator_tag = self.cfg.get("context_audio_locator_tag", None)
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         special_tokens = [self.audio_locator_tag]
@@ -62,6 +63,8 @@ class SALM(LightningModule, HFHubMixin):
             # Only add audio_start_tag if it's not already in the vocab (e.g. reserved <SPECIAL_*> tokens)
             if self.tokenizer.token_to_id(self.audio_start_tag) is None:
                 special_tokens.append(self.audio_start_tag)
+        if self.context_audio_locator_tag is not None:
+            special_tokens.append(self.context_audio_locator_tag)
         if special_tokens:
             self.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         self.llm = None  # populated by configure_model
@@ -134,6 +137,12 @@ class SALM(LightningModule, HFHubMixin):
     @property
     def audio_start_tag_id(self) -> int:
         return self.tokenizer.token_to_id(self.audio_start_tag)
+
+    @property
+    def context_audio_locator_tag_id(self) -> int | None:
+        if self.context_audio_locator_tag is None:
+            return None
+        return self.tokenizer.token_to_id(self.context_audio_locator_tag)
 
     @property
     def token_equivalent_duration(self) -> float:
@@ -212,6 +221,25 @@ class SALM(LightningModule, HFHubMixin):
         # Build the placeholder replacement dict
         placeholder_dict = {self.audio_locator_tag_id: audio_embs}
 
+        # Encode context audio via Mimi continuous encoder (pre-RVQ) if present
+        has_context_audio = (
+            self.context_audio_locator_tag is not None
+            and "context_audios" in batch
+            and batch["context_audios"] is not None
+            and batch["context_audios"].shape[0] > 0
+        )
+        if has_context_audio:
+            mimi = self._get_mimi()
+            target_sr = self.cfg.get("target_sample_rate", self.sampling_rate)
+            ctx_embeddings, ctx_frame_lens = mimi.encode_continuous(
+                batch["context_audios"], batch["context_audio_lens"],
+                source_sample_rate=target_sr,
+            )
+            # ctx_embeddings: (B, 512, T_frames) → project to LLM hidden size
+            ctx_embs = self.context_audio_projection(ctx_embeddings.transpose(1, 2))  # (B, T_frames, H)
+            ctx_embs = [emb[:flen] for emb, flen in zip(ctx_embs, ctx_frame_lens)]
+            placeholder_dict[self.context_audio_locator_tag_id] = ctx_embs
+
         # Prepare audio output embeddings if depthformer is active and target audio is present
         target_audio_codes_list = []
         has_audio_output = (
@@ -222,9 +250,10 @@ class SALM(LightningModule, HFHubMixin):
         )
         if has_audio_output:
             mimi = self._get_mimi()
+            target_sr = self.cfg.get("target_sample_rate", self.sampling_rate)
             codes, code_lens = mimi.encode(
                 batch["target_audios"], batch["target_audio_lens"],
-                source_sample_rate=self.sampling_rate,
+                source_sample_rate=target_sr,
             )
             eoaudio_id = self.cfg.depthformer.audio_vocab_size - 1  # EOAudio token
             K = self.cfg.depthformer.num_codebooks
@@ -444,7 +473,11 @@ class SALM(LightningModule, HFHubMixin):
             grads = [p.grad.float() for p in params if p.grad is not None]
             if not grads:
                 return torch.tensor(0.0, device=self.device)
-            return torch.stack([g.norm() for g in grads]).norm()
+            # Use .item() to avoid DTensor mesh mismatch when stacking
+            # grads from different FSDP2 meshes (EP vs DP_SHARD_CP)
+            return torch.tensor(
+                [g.norm().item() for g in grads], device=self.device
+            ).norm()
 
         metrics = {
             "grad_norm_llm": _grad_norm(self.llm.parameters()),
@@ -453,6 +486,8 @@ class SALM(LightningModule, HFHubMixin):
         if self.depthformer is not None:
             metrics["grad_norm_depthformer"] = _grad_norm(self.depthformer.parameters())
             metrics["grad_norm_depth_linear"] = _grad_norm(self.depthformer.depth_linear.parameters())
+        if hasattr(self, "context_audio_projection"):
+            metrics["grad_norm_context_audio_projection"] = _grad_norm(self.context_audio_projection.parameters())
         self.log_dict(metrics, on_step=True)
 
     def backward(self, *args, **kwargs):
@@ -683,6 +718,12 @@ class SALM(LightningModule, HFHubMixin):
             )
             self.depthformer = Depthformer(df_cfg).to(dtype=dtype)
 
+        # Context audio projection: Mimi continuous embeddings (512D) → LLM hidden size
+        if self.context_audio_locator_tag is not None:
+            self.context_audio_projection = torch.nn.Linear(
+                512, self.llm.config.hidden_size
+            ).to(dtype=dtype)
+
         # Note: LoRA is deferred — see salm-lora-future-work.md in memory
 
         if device_mesh is None:
@@ -706,6 +747,8 @@ class SALM(LightningModule, HFHubMixin):
             self.perception = fully_shard(self.perception, mesh=fsdp_mesh)
             if self.depthformer is not None:
                 self.depthformer = fully_shard(self.depthformer, mesh=fsdp_mesh)
+            if hasattr(self, "context_audio_projection"):
+                self.context_audio_projection = fully_shard(self.context_audio_projection, mesh=fsdp_mesh)
 
     @property
     def oomptimizer_schema(self) -> dict:

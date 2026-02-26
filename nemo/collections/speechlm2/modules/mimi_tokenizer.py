@@ -97,6 +97,51 @@ class MimiTokenizer:
         return 1920
 
     @torch.no_grad()
+    def encode_continuous(
+        self,
+        audio: torch.Tensor,
+        audio_lens: torch.Tensor,
+        source_sample_rate: int = 24000,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode audio waveforms into pre-RVQ continuous embeddings.
+
+        Runs the Mimi encoder pipeline (encoder → encoder_transformer → downsample)
+        but stops before quantization, returning the continuous 512-D embeddings.
+
+        Args:
+            audio: (B, T_samples) raw audio waveform
+            audio_lens: (B,) lengths in samples at source_sample_rate
+            source_sample_rate: sample rate of the input audio
+
+        Returns:
+            embeddings: (B, 512, T_frames) continuous pre-RVQ embeddings
+            frame_lens: (B,) lengths in frames
+        """
+        self.maybe_load(audio.device)
+
+        # Resample to Mimi's sample rate if needed
+        if source_sample_rate != MIMI_SAMPLE_RATE:
+            ratio = MIMI_SAMPLE_RATE / source_sample_rate
+            audio = _resample(audio, source_sample_rate, MIMI_SAMPLE_RATE)
+            audio_lens = (audio_lens.float() * ratio).long()
+
+        # (B, 1, T) for the encoder
+        audio_3d = audio.unsqueeze(1)
+
+        # encoder → encoder_transformer → downsample (same as _encode_frame, but no quantizer)
+        embeddings = self.model.encoder(audio_3d)  # (B, 512, T_enc)
+        encoder_outputs = self.model.encoder_transformer(embeddings.transpose(1, 2))
+        embeddings = encoder_outputs[0].transpose(1, 2)  # (B, 512, T_enc)
+        embeddings = self.model.downsample(embeddings)  # (B, 512, T_frames)
+
+        # Compute frame lengths
+        fs = self.frame_size
+        frame_lens = torch.ceil(audio_lens.float() / fs).long()
+
+        return embeddings, frame_lens
+
+    @torch.no_grad()
     def encode(
         self,
         audio: torch.Tensor,

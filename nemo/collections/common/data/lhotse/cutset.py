@@ -826,6 +826,8 @@ def magpietts_cut_to_conversation(
     audio_locator_tag: str,
     token_equivalent_duration: float,
     sample_rate: int = 16000,
+    context_sample_rate: int | None = None,
+    target_sample_rate: int | None = None,
     system_prompt: str = "Follow the instruction by the user. If you generate audio, it should sound like this reference audio:",
     user_prompt_template: str = "Generate speech from the following text: {text}",
 ) -> NeMoMultimodalConversation:
@@ -835,7 +837,7 @@ def magpietts_cut_to_conversation(
 
     The conversation structure is:
         TextTurn(role="system")     — system prompt with reference audio instruction
-        AudioTurn(role="system")    — context_audio (speaker reference) → perception/ASR encoder
+        AudioTurn(role="system")    — context_audio (speaker reference) → Mimi continuous encoder
         TextTurn(role="user")       — "Generate speech from the following text: {text}"
         AudioTurn(role="assistant") — target_audio (speech to generate) → Mimi/depthformer
 
@@ -844,17 +846,27 @@ def magpietts_cut_to_conversation(
         user: Generate speech from the following text: {text}
         assistant: <|audio|>
 
-    ``_expand_assistant_audio`` classifies AudioTurns by role: system/user AudioTurns go to
-    ``audios`` (perception encoder), assistant AudioTurns go to ``target_audios`` (depthformer).
+    ``_expand_assistant_audio`` classifies AudioTurns by role: system AudioTurns become
+    context audio (Mimi continuous encoder), assistant AudioTurns go to ``target_audios``
+    (depthformer).
+
+    Args:
+        context_sample_rate: Sample rate for context audio (Mimi continuous encoder).
+            Falls back to ``sample_rate`` if not specified.
+        target_sample_rate: Sample rate for target audio (Mimi RVQ/depthformer).
+            Falls back to ``sample_rate`` if not specified.
     """
     if isinstance(cut, NeMoMultimodalConversation):
         return cut
 
+    context_sr = context_sample_rate if context_sample_rate is not None else sample_rate
+    target_sr = target_sample_rate if target_sample_rate is not None else sample_rate
+
     reference_text = cut.supervisions[0].text
 
-    # Resample context and target audio to match ASR encoder sample rate
-    context_recording = cut.context_audio.resample(sample_rate)
-    target_recording = cut.target_audio.resample(sample_rate)
+    # Resample context and target audio to their respective sample rates
+    context_recording = cut.context_audio.resample(context_sr)
+    target_recording = cut.target_audio.resample(target_sr)
 
     # Wrap recordings in MonoCut objects (required by AudioTurn.cut)
     context_cut = MonoCut(
@@ -904,6 +916,8 @@ def read_magpietts_as_conversation(config) -> tuple[CutSet, bool]:
 
     Config options:
         - sample_rate (int): Target sample rate for resampling (default: 16000).
+        - context_sample_rate (int): Sample rate for context audio (falls back to sample_rate).
+        - target_sample_rate (int): Sample rate for target audio (falls back to sample_rate).
         - system_prompt (str): System instruction text.
         - user_prompt_template (str): User prompt template with ``{text}`` placeholder.
         - max_cer (float): Maximum allowed character error rate (default: 0.03).
@@ -914,6 +928,8 @@ def read_magpietts_as_conversation(config) -> tuple[CutSet, bool]:
     cuts, is_tarred = read_cutset_from_config(config)
 
     sample_rate = config.get("sample_rate", 16000)
+    context_sample_rate = config.get("context_sample_rate", None)
+    target_sample_rate = config.get("target_sample_rate", None)
     max_cer = config.get("max_cer", 0.03)
     min_context_speaker_similarity = config.get("min_context_speaker_similarity", 0.6)
     target_speaker = config.get("target_speaker", None)
@@ -959,6 +975,8 @@ def read_magpietts_as_conversation(config) -> tuple[CutSet, bool]:
             audio_locator_tag=config.audio_locator_tag,
             token_equivalent_duration=config.token_equivalent_duration,
             sample_rate=sample_rate,
+            context_sample_rate=context_sample_rate,
+            target_sample_rate=target_sample_rate,
             system_prompt=system_prompt,
             user_prompt_template=user_prompt_template,
         )

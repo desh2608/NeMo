@@ -936,9 +936,9 @@ def resample(example, sampling_rate):
     if isinstance(example, Cut):
         return example.resample(sampling_rate)
     elif isinstance(example, NeMoMultimodalConversation):
-        for turn in example.turns:
-            if hasattr(turn, "cut"):
-                turn.cut = turn.cut.resample(sampling_rate)
+        # Data type parsers handle per-turn resampling with correct rates;
+        # skip global resample to avoid overriding per-turn sample rates
+        # (e.g. context audio at 24kHz vs target audio at 24kHz).
         return example
     else:
         return example
