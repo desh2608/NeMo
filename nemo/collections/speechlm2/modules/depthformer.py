@@ -271,11 +271,13 @@ class Depthformer(nn.Module):
 
         # Audio output embedding: maps audio codes back into LLM hidden space
         # Each codebook gets its own slice of the embedding table, offset by codebook_offsets
-        self.audio_embedding = SharedEmbedding(
-            dim=cfg.llm_hidden_size,
-            vocab_size=cfg.audio_vocab_size * K,
-            tie_embedding=False,
-        )
+        # Plain nn.Embedding (not SharedEmbedding) since we only need embed(), not get_logits().
+        # Using SharedEmbedding caused checkpoint resume failures because the unused
+        # embedding_norm and to_logits parameters never received gradients, so the optimizer
+        # never created state for them, but the distributed checkpoint loader expected it.
+        self.audio_embedding = nn.Embedding(cfg.audio_vocab_size * K, cfg.llm_hidden_size)
+        std = 1.0 / math.sqrt(cfg.llm_hidden_size)
+        nn.init.normal_(self.audio_embedding.weight, mean=0.0, std=std)
 
         # Codebook offsets for indexing into the fused audio_embedding
         self.register_buffer("codebook_offsets", torch.arange(K) * cfg.audio_vocab_size)
@@ -446,5 +448,8 @@ class Depthformer(nn.Module):
         # Offset codes per codebook: each codebook indexes a different slice of audio_embedding
         offset_codes = codes + self.codebook_offsets  # broadcast: (..., K) + (K,)
         # Embed each codebook and sum: audio_embedding maps (audio_vocab_size * K) -> H
-        embs = self.audio_embedding.embed(offset_codes)  # (..., K, H)
+        weight = self.audio_embedding.weight
+        if isinstance(weight, DTensor):
+            weight = weight.full_tensor()
+        embs = F.embedding(offset_codes, weight)  # (..., K, H)
         return embs.sum(dim=-2)  # (..., H)
