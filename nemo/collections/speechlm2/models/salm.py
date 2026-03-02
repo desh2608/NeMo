@@ -393,6 +393,12 @@ class SALM(LightningModule, HFHubMixin):
             "audio_loss_weight_effective": (self.audio_loss_weight * audio_loss / loss).detach() if loss > 0 else text_loss.new_tensor(0.0),
             **audio_metrics,
         }
+        # Log per-group learning rates when using param_group_overrides
+        if self._trainer is not None:
+            for group in self.trainer.optimizers[0].param_groups:
+                name = group.get("name")
+                if name:
+                    ans[f"learning_rate/{name}"] = torch.as_tensor(group["lr"])
         self.log_dict(ans, on_step=True)
         return ans
 

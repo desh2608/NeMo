@@ -37,6 +37,16 @@ def configure_optimizers(model: LightningModule):
     * (optional) ``prevent_freeze_params`` with a list of regex pattern for keeping specific parameters trainable
         (overrides ``freeze_params``).
 
+    * (optional) ``param_group_overrides`` with a list of dicts, each containing a ``pattern`` (regex)
+        and optimizer kwargs (e.g., ``lr``) to apply to matching parameters.  First matching pattern wins.
+        Unmatched parameters inherit the base optimizer settings.  Example::
+
+            param_group_overrides:
+              - pattern: "^depthformer\\..*$"
+                lr: 1e-4
+              - pattern: "^llm\\..*$"
+                lr: 1e-5
+
     * (optional) ``lr_scheduler`` with hydra-style ``_target_`` pointing to LR scheduler class,
         and the remaining options passed directly to its ``__init__`` method.
 
@@ -51,12 +61,26 @@ def configure_optimizers(model: LightningModule):
     """
     assert hasattr(model, "cfg"), "Expected `model.cfg` attribute to exist."
     assert "optimizer" in model.cfg, "Expected `model.cfg` to contain 'optimizer' configuration."
-    parameters = freeze_and_subset(
-        model.named_parameters(),
-        exclude_patterns=model.cfg.get("freeze_params", []),
-        keep_patterns=model.cfg.get("prevent_freeze_params", []),
-    )
-    optimizer = hydra.utils.instantiate(model.cfg.optimizer, parameters, _convert_='all')
+
+    param_group_overrides = list(model.cfg.get("param_group_overrides", []))
+
+    if param_group_overrides:
+        named_params = list(freeze_and_subset(
+            model.named_parameters(),
+            exclude_patterns=model.cfg.get("freeze_params", []),
+            keep_patterns=model.cfg.get("prevent_freeze_params", []),
+            named=True,
+        ))
+        param_groups = build_param_groups(named_params, param_group_overrides)
+        optimizer = hydra.utils.instantiate(model.cfg.optimizer, param_groups, _convert_='all')
+    else:
+        parameters = freeze_and_subset(
+            model.named_parameters(),
+            exclude_patterns=model.cfg.get("freeze_params", []),
+            keep_patterns=model.cfg.get("prevent_freeze_params", []),
+        )
+        optimizer = hydra.utils.instantiate(model.cfg.optimizer, parameters, _convert_='all')
+
     ans = {"optimizer": optimizer}
     if "lr_scheduler" in model.cfg:
         lr_scheduler = hydra.utils.instantiate(model.cfg.lr_scheduler, optimizer)
@@ -68,7 +92,8 @@ def freeze_and_subset(
     named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
     exclude_patterns: list[str],
     keep_patterns: list[str] = None,
-) -> Generator[torch.nn.Parameter, None, None]:
+    named: bool = False,
+) -> Generator:
     """
     Utility used to freeze select model parameters, and skip them for the purpose
     of initializing an optimizer's parameter group.
@@ -79,10 +104,11 @@ def freeze_and_subset(
             and excluded from optimization.
         keep_patterns: A list of regex patterns matching parameter names to be trained.
             This list overrides all matches to `exclude_patterns`.
+        named: If True, yield ``(name, param)`` tuples instead of just ``param``.
+            Useful when downstream code needs parameter names (e.g., for param group assignment).
 
     Returns:
-        A generator over parameters, equivalent to calling `torch.nn.Module.parameters()`,
-            that will be passed to the optimizer and trained.
+        A generator over parameters (or (name, param) tuples if ``named=True``).
 
     Example:
 
@@ -127,7 +153,7 @@ def freeze_and_subset(
             param.requires_grad = False
             discard = True
         if not discard:
-            yield param
+            yield (name, param) if named else param
             trainable += param.numel()
         else:
             nontrainable += param.numel()
@@ -142,6 +168,75 @@ def freeze_and_subset(
     if unused_keep_patterns := [k for k, v in keep_counter.items() if v == 0]:
         msg = "['" + "', '".join(unused_keep_patterns) + "']"
         logging.warning(f"Parameter freeze-preventing patterns UNMATCHED against any parameter: {msg} (bad regexp?)")
+
+
+def build_param_groups(
+    named_parameters: list[tuple[str, torch.nn.Parameter]],
+    overrides: list[dict],
+) -> list[dict]:
+    """
+    Categorize trainable parameters into optimizer param groups based on regex patterns.
+
+    Each override dict must contain a ``pattern`` key (regex) and may contain any optimizer
+    kwargs (e.g., ``lr``, ``weight_decay``).  First matching pattern wins.  Parameters that
+    don't match any pattern go into a default group that inherits the optimizer's base settings.
+
+    An optional ``name`` key in each override is used for logging and is preserved in the
+    resulting param group dict (PyTorch optimizers ignore unknown keys).
+
+    Args:
+        named_parameters: List of (name, param) tuples for trainable parameters.
+        overrides: List of dicts from ``param_group_overrides`` config.
+
+    Returns:
+        List of param group dicts suitable for passing to an optimizer constructor.
+    """
+    compiled: list[tuple[re.Pattern, str, dict]] = []
+    for o in overrides:
+        o = dict(o)  # avoid mutating config
+        pattern = re.compile(o.pop("pattern"))
+        name = o.pop("name", pattern.pattern)
+        compiled.append((pattern, name, o))
+
+    # One bucket per override + default
+    groups: dict[int, list[torch.nn.Parameter]] = {i: [] for i in range(len(compiled))}
+    default_params: list[torch.nn.Parameter] = []
+
+    for pname, param in named_parameters:
+        matched = False
+        for i, (pattern, _, _) in enumerate(compiled):
+            if pattern.search(pname):
+                groups[i].append(param)
+                matched = True
+                break
+        if not matched:
+            default_params.append(param)
+
+    result: list[dict] = []
+    # Default group first (index 0) — no overrides, uses optimizer's base settings.
+    if default_params:
+        result.append({"params": default_params, "name": "default"})
+
+    for i, (pattern, name, kwargs) in enumerate(compiled):
+        params = groups[i]
+        if params:
+            result.append({"params": params, "name": name, **kwargs})
+        else:
+            logging.warning(
+                f"param_group_overrides pattern '{pattern.pattern}' matched no trainable parameters"
+            )
+
+    # Log group stats
+    for group in result:
+        n_params = sum(p.numel() for p in group["params"])
+        extra = ", ".join(f"{k}={v}" for k, v in group.items() if k not in ("params", "name"))
+        label = group.get("name", "unnamed")
+        msg = f"Param group '{label}': {n_params} parameters"
+        if extra:
+            msg += f" ({extra})"
+        logging.info(msg)
+
+    return result
 
 
 def is_frozen(module: torch.nn.Module) -> bool:
