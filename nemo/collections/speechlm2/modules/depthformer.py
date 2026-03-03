@@ -244,8 +244,8 @@ class Depthformer(nn.Module):
         self.cfg = cfg
         K = cfg.num_codebooks
 
-        # Project LLM hidden states to per-codebook depthformer inputs
-        self.depth_linear = nn.Linear(cfg.llm_hidden_size, cfg.depthformer_dim * K)
+        # Project LLM hidden states to depthformer dim (shared across codebooks)
+        self.depth_linear = nn.Linear(cfg.llm_hidden_size, cfg.depthformer_dim)
 
         # Transformer backbone
         scale = 1.0 / math.sqrt(2 * cfg.depthformer_layers)
@@ -355,16 +355,16 @@ class Depthformer(nn.Module):
         if h.shape[0] == 0:
             return h.new_tensor(0.0), {}
 
-        # Project to per-codebook inputs: (N, K*D) -> (N, K, D)
-        df_in = self.depth_linear(h).reshape(-1, K, self.cfg.depthformer_dim)
+        # Project LLM hidden state to depthformer dim (shared across codebooks)
+        df_in = self.depth_linear(h)  # (N, D)
 
         # Sequential codebook prediction with teacher forcing
-        prev_emb = torch.zeros_like(df_in[:, 0])  # (N, D)
+        prev_emb = torch.zeros_like(df_in)  # (N, D)
         total_loss = h.new_tensor(0.0)
         metrics = {}
 
         for i in range(K):
-            cur_input = (df_in[:, i] + prev_emb).unsqueeze(1)  # (N, 1, D)
+            cur_input = (df_in + prev_emb).unsqueeze(1)  # (N, 1, D)
             df_out, _ = self._run_depthformer(cur_input)  # (N, 1, D)
             logits = self.depth_embeddings[i].get_logits(df_out.squeeze(1))  # (N, V)
             loss_i = F.cross_entropy(logits, targets[:, i])
@@ -404,7 +404,7 @@ class Depthformer(nn.Module):
         K = self.cfg.num_codebooks
         B = llm_hidden_state.shape[0]
 
-        df_in = self.depth_linear(llm_hidden_state).reshape(B, K, self.cfg.depthformer_dim)
+        df_in = self.depth_linear(llm_hidden_state)  # (B, D)
         prev_emb = torch.zeros(B, self.cfg.depthformer_dim, device=llm_hidden_state.device, dtype=llm_hidden_state.dtype)
         cache = None
 
@@ -412,7 +412,7 @@ class Depthformer(nn.Module):
         out_tokens = []
 
         for i in range(K):
-            cur_input = (df_in[:, i] + prev_emb).unsqueeze(1)  # (B, 1, D)
+            cur_input = (df_in + prev_emb).unsqueeze(1)  # (B, 1, D)
             df_out, cache = self._run_depthformer(cur_input, cache)  # (B, 1, D)
             logits = self.depth_embeddings[i].get_logits(df_out.squeeze(1))  # (B, V)
 
