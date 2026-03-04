@@ -372,8 +372,8 @@ class Depthformer(nn.Module):
             total_loss = total_loss + weighted_loss_i
             metrics[f"audio_loss_cb{i}"] = loss_i.detach()
             metrics[f"audio_loss_cb{i}_weighted"] = weighted_loss_i.detach()
-            if i == 0:
-                metrics["audio_acc_cb0"] = (logits.detach().argmax(-1) == targets[:, 0]).float().mean()
+            top10_preds = logits.detach().topk(10, dim=-1).indices  # (N, 10)
+            metrics[f"audio_acc_top10_cb{i}"] = (top10_preds == targets[:, i].unsqueeze(-1)).any(-1).float().mean()
             # Teacher forcing: embed the ground-truth target
             prev_emb = self.depth_embeddings[i].embed(targets[:, i])  # (N, D)
 
