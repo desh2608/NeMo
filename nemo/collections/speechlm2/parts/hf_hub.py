@@ -90,6 +90,9 @@ class HFHubMixin(
         # this setting skips loading the original pretrained ASR and LLM weights, and loads the
         # final trained model weights directly.
         model_kwargs['cfg']['pretrained_weights'] = False
+        # Also skip pretrained depthformer loading — the HF checkpoint has the trained weights
+        if 'depthformer' in model_kwargs['cfg'] and model_kwargs['cfg']['depthformer']:
+            model_kwargs['cfg']['depthformer']['pretrained_depthformer'] = None
 
         if device_mesh is None:
             # Non-distributed: existing flow unchanged
@@ -228,9 +231,11 @@ def _load_state_dict_with_dtensors(model, weight_dir):
         model: The model with DTensor parameters (after ``configure_model``).
         weight_dir: Directory containing ``.safetensors`` file(s).
     """
+    import torch
     from itertools import chain
 
     import torch.distributed.checkpoint as dcp
+    from nemo.utils import logging
     from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 
     # Build state dict from named_parameters/named_buffers.
@@ -242,7 +247,25 @@ def _load_state_dict_with_dtensors(model, weight_dir):
     # checkpoint (e.g. positional-encoding buffers computed at init).
     # Read the checkpoint metadata first and keep only matching keys.
     reader = _HuggingFaceStorageReader(path=weight_dir)
-    checkpoint_keys = reader.read_metadata().state_dict_metadata.keys()
+    checkpoint_keys = set(reader.read_metadata().state_dict_metadata.keys())
+    model_keys = set(all_params.keys())
+
+    matched = model_keys & checkpoint_keys
+    model_only = model_keys - checkpoint_keys
+    ckpt_only = checkpoint_keys - model_keys
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        logging.info(
+            f"Loading HF weights: {len(matched)} matched, "
+            f"{len(model_only)} model-only, {len(ckpt_only)} checkpoint-only "
+            f"(out of {len(model_keys)} model keys, {len(checkpoint_keys)} checkpoint keys)"
+        )
+        if model_only:
+            logging.warning(f"Keys in model but NOT in checkpoint (will stay at init): {sorted(model_only)[:20]}")
+        if ckpt_only:
+            logging.warning(f"Keys in checkpoint but NOT in model (will be skipped): {sorted(ckpt_only)[:20]}")
+
     state_dict = {k: v for k, v in all_params.items() if k in checkpoint_keys}
 
     # DCP + HF storage reader: parses safetensors header for byte offsets,

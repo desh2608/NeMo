@@ -52,7 +52,7 @@ class SALM(LightningModule, HFHubMixin):
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
         self.audio_out_locator_tag = self.cfg.get("audio_out_locator_tag", "<|audio_out|>")
-        self.audio_start_tag = self.cfg.get("audio_start_tag", "<SPECIAL_18>")
+        self.audio_start_tag = self.cfg.get("audio_start_tag", "<SPECIAL_99>")
         self.audio_loss_weight = self.cfg.get("audio_loss_weight", 1.0)
         self.context_audio_locator_tag = self.cfg.get("context_audio_locator_tag", None)
 
@@ -60,8 +60,10 @@ class SALM(LightningModule, HFHubMixin):
         special_tokens = [self.audio_locator_tag]
         if self.cfg.get("depthformer") is not None:
             special_tokens.append(self.audio_out_locator_tag)
-            # Only add audio_start_tag if it's not already in the vocab (e.g. reserved <SPECIAL_*> tokens)
-            if self.tokenizer.token_to_id(self.audio_start_tag) is None:
+            # Only add audio_start_tag if it's not already in the vocab (e.g. reserved <SPECIAL_*> tokens).
+            # token_to_id returns 0 (<unk>) for unknown tokens, not None, so check both.
+            _ast_id = self.tokenizer.token_to_id(self.audio_start_tag)
+            if _ast_id is None or _ast_id == self.tokenizer.token_to_id("<unk>"):
                 special_tokens.append(self.audio_start_tag)
         if self.context_audio_locator_tag is not None:
             special_tokens.append(self.context_audio_locator_tag)
@@ -654,6 +656,239 @@ class SALM(LightningModule, HFHubMixin):
                 generation_config=generation_config,
             )
         return answer_tokens
+
+    def _get_detokenizer(self, path: str):
+        """Lazy-load and cache the LFM2 audio detokenizer (not a submodule)."""
+        if self._detokenizer is None:
+            from nemo.collections.speechlm2.modules.lfm2_detokenizer import load_lfm2_detokenizer
+
+            self._detokenizer = load_lfm2_detokenizer(path, device=str(self.device))
+        return self._detokenizer
+
+    @torch.no_grad()
+    def generate_speech(
+        self,
+        prompts: list[list[dict]] | torch.Tensor,
+        audios: torch.Tensor = None,
+        audio_lens: torch.Tensor = None,
+        context_audios: torch.Tensor = None,
+        context_audio_lens: torch.Tensor = None,
+        max_new_tokens: int = 2048,
+        max_audio_frames: int = 1500,
+        text_temperature: float = 0.0,
+        audio_temperature: float = 0.8,
+        text_top_k: int | None = None,
+        audio_top_k: int | None = 50,
+        detokenizer_path: str | None = None,
+        enable_thinking: bool = False,
+    ) -> dict:
+        """
+        Generate text and optionally audio (speech) given text/audio prompts.
+
+        Uses a custom autoregressive loop: the LLM generates text tokens first,
+        then upon emitting ``audio_start_tag`` (``<SPECIAL_99>``), switches to audio
+        mode where the depthformer predicts Mimi codebook tokens frame-by-frame
+        until EOAudio. Audio codes are converted to waveforms via LFM2 detokenizer.
+
+        Processing is sequential per example (batch_size=1 per generation loop).
+
+        Args:
+            prompts: List of conversation dicts (one per example) or pre-tokenized Tensor.
+            audios: Input audio for S2S mode, shape (B, T_samples).
+            audio_lens: Lengths for ``audios``, shape (B,).
+            context_audios: Speaker reference audio for TTS mode, shape (B, T_samples).
+            context_audio_lens: Lengths for ``context_audios``, shape (B,).
+            max_new_tokens: Max text tokens to generate before audio.
+            max_audio_frames: Max audio frames (~12.5 fps, 1500 frames ~ 2 min).
+            text_temperature: Sampling temperature for text (0.0 = greedy).
+            audio_temperature: Sampling temperature for audio codebook tokens.
+            text_top_k: Top-k for text sampling (None = no filtering).
+            audio_top_k: Top-k for audio sampling.
+            detokenizer_path: Path to LFM2 detokenizer weights dir. If None, no waveform output.
+            enable_thinking: Enable thinking tokens in prompt formatting.
+
+        Returns:
+            dict with keys:
+                - ``text_tokens``: list of list[int], per-example generated text token IDs
+                - ``audio_codes``: list of (T_frames, K) Tensor or None per example
+                - ``audio_waveforms``: list of (T_samples,) Tensor or None per example (24kHz)
+                - ``text``: list of str, decoded text strings
+        """
+        assert self.depthformer is not None, "generate_speech() requires a model with depthformer"
+        _sync = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+        # --- Tokenize prompts ---
+        if isinstance(prompts, torch.Tensor):
+            all_tokens = prompts.to(self.device)
+        else:
+            if (
+                maybe_audio := _resolve_audios_in_prompt(prompts, sampling_rate=self.sampling_rate, device=self.device)
+            ) is not None:
+                assert audios is None and audio_lens is None, (
+                    "Audios cannot be provided via prompts and audios/audio_lens simultaneously."
+                )
+                audios, audio_lens = maybe_audio
+            formatter = PromptFormatter.resolve(self.cfg.prompt_format)(self.tokenizer)
+            all_tokens = left_collate_vectors(
+                [formatter.encode_dialog(turns=prompt, enable_thinking=enable_thinking)["input_ids"] for prompt in prompts],
+                padding_value=self.text_pad_id,
+            ).to(self.device)
+
+        batch_size = all_tokens.shape[0]
+
+        # --- Encode audios ---
+        has_source_audio = audios is not None and audio_lens is not None
+        if has_source_audio:
+            audio_embeds, audio_embed_lens = self.perception(
+                audios.to(self.device), audio_lens.to(self.device)
+            )
+            audio_embeds_list = [audio_embeds[i, :elen] for i, elen in enumerate(audio_embed_lens)]
+        else:
+            audio_embeds_list = []
+
+        has_context_audio = (
+            self.context_audio_locator_tag is not None
+            and context_audios is not None
+            and context_audio_lens is not None
+        )
+        if has_context_audio:
+            mimi = self._get_mimi()
+            target_sr = self.cfg.get("target_sample_rate", self.sampling_rate)
+            ctx_embeddings, ctx_frame_lens = mimi.encode_continuous(
+                context_audios.to(self.device),
+                context_audio_lens.to(self.device),
+                source_sample_rate=target_sr,
+            )
+            ctx_embs = self.context_audio_projection(
+                ctx_embeddings.transpose(1, 2).to(dtype=self.context_audio_projection.weight.dtype)
+            )
+            ctx_embs_list = [emb[:flen] for emb, flen in zip(ctx_embs, ctx_frame_lens)]
+        else:
+            ctx_embs_list = []
+
+        # --- Per-example sequential generation ---
+        all_text_tokens = []
+        all_audio_codes = []
+        all_audio_waveforms = []
+        all_text = []
+
+        eoaudio_id = self.cfg.depthformer.audio_vocab_size - 1
+
+        for ex_idx in range(batch_size):
+            tokens_1d = all_tokens[ex_idx]
+            # Remove left-padding
+            nonpad = (tokens_1d != self.text_pad_id).nonzero(as_tuple=True)[0]
+            if nonpad.numel() > 0:
+                tokens_1d = tokens_1d[nonpad[0]:]
+            tokens_1d = tokens_1d.unsqueeze(0)  # (1, T)
+
+            # Build placeholder dict for this example
+            placeholder_dict = {}
+            if has_source_audio and ex_idx < len(audio_embeds_list):
+                placeholder_dict[self.audio_locator_tag_id] = [audio_embeds_list[ex_idx]]
+            if has_context_audio and ex_idx < len(ctx_embs_list):
+                placeholder_dict[self.context_audio_locator_tag_id] = [ctx_embs_list[ex_idx]]
+
+            # Embed tokens, replace placeholders
+            tokens_to_embed = tokens_1d.clone()
+            for pid in placeholder_dict:
+                tokens_to_embed = torch.where(tokens_to_embed == pid, 0, tokens_to_embed)
+            text_embs = self._embed_tokens(tokens_to_embed)
+            tokens_1d = tokens_1d.to(text_embs.device)
+
+            if placeholder_dict:
+                input_embeds, _, attention_mask, _ = replace_placeholders_and_build_targets(
+                    input_ids=tokens_1d,
+                    embeds=text_embs,
+                    padding_id=self.text_pad_id,
+                    placeholder_replacement_dict=placeholder_dict,
+                )
+            else:
+                input_embeds = text_embs
+                attention_mask = (tokens_1d != self.text_pad_id)
+
+            # --- Prefill ---
+            out = self.forward(input_embeds, attention_mask=attention_mask, use_cache=True)
+            cache = out.get("cache")
+
+            # Sample first token from prefill logits
+            next_token_id = _sample_token(out["logits"][:, -1, :], text_temperature, text_top_k)
+            if _sync:
+                torch.distributed.broadcast(next_token_id, src=0)
+
+            mode = "text"
+            text_tokens = []
+            audio_codes = []
+
+            # --- Autoregressive generation loop ---
+            for step in range(max_new_tokens + max_audio_frames):
+                if mode == "text":
+                    tok = next_token_id.item()
+                    text_tokens.append(tok)
+
+                    if tok == self.text_eos_id:
+                        break
+                    if tok == self.audio_start_tag_id:
+                        mode = "audio"
+
+                    # Embed this token for next step
+                    in_emb = self._embed_tokens(next_token_id.view(1, 1))  # (1, 1, H)
+
+                elif mode == "audio":
+                    # Use the hidden state from the last LLM output to predict audio frame
+                    hidden_state = out["hidden_states"][:, -1, :]  # (1, H)
+                    audio_frame = self.depthformer.forward_inference(
+                        hidden_state, temperature=audio_temperature, top_k=audio_top_k
+                    )  # (1, K)
+                    if _sync:
+                        torch.distributed.broadcast(audio_frame, src=0)
+
+                    if audio_frame[0, 0].item() == eoaudio_id:
+                        break
+                    audio_codes.append(audio_frame.squeeze(0))  # (K,)
+                    if len(audio_codes) >= max_audio_frames:
+                        break
+
+                    # Embed audio tokens for next step input
+                    in_emb = self.depthformer.embed_audio_tokens(audio_frame).unsqueeze(1)  # (1, 1, H)
+
+                # Forward step with cache
+                out = self.forward(in_emb, cache=cache, use_cache=True)
+                cache = out.get("cache")
+
+                if mode == "text":
+                    next_token_id = _sample_token(out["logits"][:, -1, :], text_temperature, text_top_k)
+                    if _sync:
+                        torch.distributed.broadcast(next_token_id, src=0)
+
+            # Decode text
+            text_str = self.tokenizer.ids_to_text(text_tokens)
+            all_text_tokens.append(text_tokens)
+            all_text.append(text_str)
+
+            # Process audio codes
+            if audio_codes:
+                codes_tensor = torch.stack(audio_codes, dim=0)  # (T_frames, K)
+                all_audio_codes.append(codes_tensor)
+
+                # Detokenize to waveform
+                if detokenizer_path is not None:
+                    detok = self._get_detokenizer(detokenizer_path)
+                    codes_for_detok = codes_tensor.T.unsqueeze(0)  # (1, K, T_frames)
+                    waveform = detok(codes_for_detok).squeeze(0)  # (T_samples,)
+                    all_audio_waveforms.append(waveform)
+                else:
+                    all_audio_waveforms.append(None)
+            else:
+                all_audio_codes.append(None)
+                all_audio_waveforms.append(None)
+
+        return {
+            "text_tokens": all_text_tokens,
+            "audio_codes": all_audio_codes,
+            "audio_waveforms": all_audio_waveforms,
+            "text": all_text,
+        }
 
     def configure_optimizers(self):
         return configure_optimizers(self)
